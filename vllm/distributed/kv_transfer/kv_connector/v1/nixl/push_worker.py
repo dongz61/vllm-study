@@ -52,6 +52,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.tp_mapping import ReadSpec
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.utils import get_base_request_id
+from vllm.distributed.kv_transfer.pd_trace import trace_event
 from vllm.logger import init_logger
 
 if TYPE_CHECKING:
@@ -79,6 +80,7 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
         kv_cache_config: "KVCacheConfig",
     ):
         super().__init__(vllm_config, engine_id, kv_cache_config)
+        self.pd_trace_mode = "push"
 
         # Push-specific state.
         # P-side: outgoing WRITE handles awaiting completion, keyed by
@@ -320,7 +322,23 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
             return
         for rank, agent_name in agents.items():
             try:
+                trace_event(
+                    "push_registration_start",
+                    req_id,
+                    role="decode",
+                    remote_engine_id=engine_id,
+                    remote_rank=rank,
+                    notif_bytes=len(notif_msg),
+                )
                 self.nixl_wrapper.send_notif(agent_name, notif_msg=notif_msg)
+                trace_event(
+                    "push_registration_end",
+                    req_id,
+                    role="decode",
+                    remote_engine_id=engine_id,
+                    remote_rank=rank,
+                    notif_bytes=len(notif_msg),
+                )
             except Exception as e:
                 self._log_failure(
                     failure_type="push_reg_notif_failed",
@@ -635,6 +653,18 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
                 remote_xfer_side_handle,
                 remote_block_descs_ids,
                 notif_msg=notif_id,
+            )
+            trace_event(
+                "push_transfer_start",
+                request_id,
+                role="prefill",
+                decode_request_id=decode_request_id,
+                remote_engine_id=dst_engine_id,
+                remote_rank=remote_rank,
+                num_local_groups=len(local_block_ids),
+                num_remote_groups=len(remote_block_ids),
+                num_local_blocks=sum(len(group) for group in local_block_ids),
+                num_remote_blocks=sum(len(group) for group in remote_block_ids),
             )
             self.nixl_wrapper.transfer(handle)
             # Track push WRITE handles so P can free blocks once done.

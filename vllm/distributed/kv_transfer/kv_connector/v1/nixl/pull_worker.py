@@ -17,6 +17,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.tp_mapping import (
     ReadSpec,
 )
+from vllm.distributed.kv_transfer.pd_trace import trace_event
 from vllm.logger import init_logger
 
 if TYPE_CHECKING:
@@ -36,6 +37,7 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
         kv_cache_config: "KVCacheConfig",
     ):
         super().__init__(vllm_config, engine_id, kv_cache_config)
+        self.pd_trace_mode = "pull"
 
     def start_load_kv(self, metadata: NixlConnectorMetadata):
         """
@@ -310,6 +312,18 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
             )
 
             # Begin async xfer.
+            trace_event(
+                "pull_transfer_start",
+                request_id,
+                role="decode",
+                remote_request_id=remote_request_id,
+                remote_engine_id=dst_engine_id,
+                remote_rank=remote_rank,
+                num_local_groups=len(local_block_ids),
+                num_remote_groups=len(remote_block_ids),
+                num_local_blocks=sum(len(group) for group in local_block_ids),
+                num_remote_blocks=sum(len(group) for group in remote_block_ids),
+            )
             self.nixl_wrapper.transfer(handle)
 
             # Use handle to check completion in future step().

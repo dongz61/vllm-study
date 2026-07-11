@@ -58,6 +58,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.ssm_conv_transfer_utils import
     MambaConvSplitInfo,
     derive_mamba_conv_split,
 )
+from vllm.distributed.kv_transfer.pd_trace import trace_event
 from vllm.distributed.nixl_utils import NixlWrapper, nixl_agent_config
 from vllm.distributed.parallel_state import (
     get_tensor_model_parallel_rank,
@@ -433,6 +434,7 @@ class NixlBaseConnectorWorker:
         # Uses Queue for thread-safe cross-thread coordination with the
         # background handshake thread, matching the _ready_requests pattern.
         self._failed_recv_reqs: queue.Queue[ReqId] = queue.Queue()
+        self._pd_transfer_sleep_ms = self._get_pd_transfer_sleep_ms()
 
         # Handshake metadata of this worker for NIXL transfers.
         self.xfer_handshake_metadata: NixlHandshakePayload | None = None
@@ -2041,11 +2043,55 @@ class NixlBaseConnectorWorker:
 
             if not in_progress:
                 # Only report request as completed when all transfers are done.
+                if transfers is self._recving_transfers:
+                    self._trace_recv_transfer_done(req_id, len(handles))
                 done_req_ids.add(req_id)
                 del transfers[req_id]
             else:
                 transfers[req_id] = in_progress
         return done_req_ids
+
+    def _trace_recv_transfer_done(self, req_id: str, num_handles: int) -> None:
+        mode = getattr(self, "pd_trace_mode", "nixl")
+        if self._pd_transfer_sleep_ms > 0:
+            trace_event(
+                f"{mode}_transfer_sleep_start",
+                req_id,
+                role="decode",
+                sleep_ms=self._pd_transfer_sleep_ms,
+                num_handles=num_handles,
+            )
+            time.sleep(self._pd_transfer_sleep_ms / 1000.0)
+            trace_event(
+                f"{mode}_transfer_sleep_end",
+                req_id,
+                role="decode",
+                sleep_ms=self._pd_transfer_sleep_ms,
+                num_handles=num_handles,
+            )
+
+        trace_event(
+            f"{mode}_transfer_end",
+            req_id,
+            role="decode",
+            num_handles=num_handles,
+            injected_sleep_ms=self._pd_transfer_sleep_ms,
+        )
+        trace_event(
+            f"{mode}_kv_recv_done",
+            req_id,
+            role="decode",
+            num_handles=num_handles,
+            injected_sleep_ms=self._pd_transfer_sleep_ms,
+        )
+
+    @staticmethod
+    def _get_pd_transfer_sleep_ms() -> float:
+        raw_value = os.getenv("VLLM_PD_TRANSFER_SLEEP_MS", "0")
+        try:
+            return float(raw_value)
+        except ValueError:
+            return 0.0
 
     def _handle_failed_transfer(self, req_id: str, handle: int | None):
         """

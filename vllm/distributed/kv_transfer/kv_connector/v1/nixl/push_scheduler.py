@@ -38,6 +38,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
     NixlConnectorMetadata,
     ReqId,
 )
+from vllm.distributed.kv_transfer.pd_trace import trace_event
 from vllm.logger import init_logger
 
 if TYPE_CHECKING:
@@ -254,6 +255,14 @@ class NixlPushConnectorScheduler(NixlBaseConnectorScheduler):
         delay_free_blocks = any(len(group) > 0 for group in block_ids)
         remote_num_tokens = 0
         if delay_free_blocks:
+            trace_event(
+                "push_prefill_finished",
+                request.request_id,
+                role="prefill",
+                num_computed_tokens=request.num_computed_tokens,
+                num_block_groups=len(block_ids),
+                num_blocks=sum(len(group) for group in block_ids),
+            )
             logger.debug(
                 "NixlPushConnector request_finished(%s) waiting for %d seconds "
                 "before releasing blocks",
