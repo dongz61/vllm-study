@@ -17,6 +17,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1 import (KVConnectorBase_V1,
                                                           KVConnectorRole)
 from vllm.distributed.kv_transfer.kv_connector.v1.metrics import (
     KVConnectorStats)
+from vllm.distributed.kv_transfer.pd_trace import trace_event
 from vllm.logger import init_logger
 from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
 from vllm.v1.core.encoder_cache_manager import (EncoderCacheManager,
@@ -1286,6 +1287,7 @@ class Scheduler(SchedulerInterface):
         for req_id in (kv_connector_output.finished_recving or ()):
             logger.debug("Finished recving KV transfer for request %s", req_id)
             self.finished_recving_kv_req_ids.add(req_id)
+            trace_event("decode_remote_kv_ready", req_id, role="decode")
         for req_id in (kv_connector_output.finished_sending or ()):
             logger.debug("Finished sending KV transfer for request %s", req_id)
             if req_id not in self.requests:

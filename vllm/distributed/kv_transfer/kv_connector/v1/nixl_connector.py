@@ -4,6 +4,7 @@ import contextlib
 import copy
 import logging
 import math
+import os
 import queue
 import threading
 import time
@@ -26,6 +27,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     CopyBlocksOp, KVConnectorBase_V1, KVConnectorMetadata, KVConnectorRole)
 from vllm.distributed.kv_transfer.kv_connector.v1.metrics import (
     KVConnectorStats)
+from vllm.distributed.kv_transfer.pd_trace import trace_event
 from vllm.distributed.parallel_state import (
     get_tensor_model_parallel_rank, get_tensor_model_parallel_world_size,
     get_tp_group)
@@ -441,6 +443,13 @@ class NixlConnectorScheduler:
         delay_free_blocks = len(block_ids) > 0
 
         if delay_free_blocks:
+            trace_event(
+                "pull_prefill_finished",
+                request.request_id,
+                role="prefill",
+                num_computed_tokens=request.num_computed_tokens,
+                num_blocks=len(block_ids),
+            )
             # Prefill request on remote. It will be read from D upon completion
             self._reqs_need_send[request.request_id] = time.perf_counter(
             ) + envs.VLLM_NIXL_ABORT_REQUEST_TIMEOUT
@@ -468,6 +477,7 @@ class NixlConnectorWorker:
         # Config.
         self.vllm_config = vllm_config
         self.block_size = vllm_config.cache_config.block_size
+        self._pd_transfer_sleep_ms = self._get_pd_transfer_sleep_ms()
 
         self.nixl_backends = \
             vllm_config.kv_transfer_config.get_from_extra_config(
@@ -1178,9 +1188,51 @@ class NixlConnectorWorker:
                     raise RuntimeError("Transfer failed with state %s",
                                        xfer_state)
             if not in_progress:
+                self._trace_recv_transfer_done(req_id, len(handles))
                 done_req_ids.add(req_id)
                 del transfers[req_id]
         return done_req_ids
+
+    def _trace_recv_transfer_done(self, req_id: str, num_handles: int) -> None:
+        if self._pd_transfer_sleep_ms > 0:
+            trace_event(
+                "pull_transfer_sleep_start",
+                req_id,
+                role="decode",
+                sleep_ms=self._pd_transfer_sleep_ms,
+                num_handles=num_handles,
+            )
+            time.sleep(self._pd_transfer_sleep_ms / 1000.0)
+            trace_event(
+                "pull_transfer_sleep_end",
+                req_id,
+                role="decode",
+                sleep_ms=self._pd_transfer_sleep_ms,
+                num_handles=num_handles,
+            )
+
+        trace_event(
+            "pull_transfer_end",
+            req_id,
+            role="decode",
+            num_handles=num_handles,
+            injected_sleep_ms=self._pd_transfer_sleep_ms,
+        )
+        trace_event(
+            "pull_kv_recv_done",
+            req_id,
+            role="decode",
+            num_handles=num_handles,
+            injected_sleep_ms=self._pd_transfer_sleep_ms,
+        )
+
+    @staticmethod
+    def _get_pd_transfer_sleep_ms() -> float:
+        raw_value = os.getenv("VLLM_PD_TRANSFER_SLEEP_MS", "0")
+        try:
+            return float(raw_value)
+        except ValueError:
+            return 0.0
 
     def start_load_kv(self, metadata: NixlConnectorMetadata):
         """
@@ -1330,6 +1382,16 @@ class NixlConnectorWorker:
         )
 
         # Begin async xfer.
+        trace_event(
+            "pull_transfer_start",
+            request_id,
+            role="decode",
+            remote_engine_id=dst_engine_id,
+            num_local_blocks=len(local_block_ids),
+            num_remote_blocks=len(remote_block_ids),
+            num_local_descs=len(local_block_descs_ids),
+            num_remote_descs=len(remote_block_descs_ids),
+        )
         self.nixl_wrapper.transfer(handle)
 
         # Use handle to check completion in future step().
