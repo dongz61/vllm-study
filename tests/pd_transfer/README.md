@@ -22,6 +22,17 @@ cp tests/pd_transfer/config.example.env tests/pd_transfer/config.env
 
 Edit at least `MODEL`, `BENCH_TOKENIZER`, GPU ids, lengths, and sleep values.
 
+By default, the runner executes the Cartesian product of `INPUT_LENS`,
+`OUTPUT_LENS`, `CONCURRENCIES`, and `TRANSFER_SLEEP_MS_LIST`. To run only
+selected cases, set `BENCH_CASES` instead:
+
+```bash
+BENCH_CASES="2048,32,1,0 2048,32,1,20 4096,32,1,0 4096,32,1,40"
+```
+
+Each entry is `input_len,output_len,concurrency,sleep_ms`. When `BENCH_CASES`
+is set, the matrix variables are ignored.
+
 ```bash
 bash tests/pd_transfer/run_pd_transfer_bench.sh tests/pd_transfer/config.env
 python tests/pd_transfer/parse_pd_trace.py results/pd_transfer/<run-id>

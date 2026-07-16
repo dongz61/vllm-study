@@ -16,20 +16,98 @@ mkdir -p "${RUN_ROOT}"
 
 PIDS=()
 
+kill_tree() {
+  local pid=$1
+  local child
+  if ! kill -0 "${pid}" >/dev/null 2>&1; then
+    return 0
+  fi
+  while read -r child; do
+    [[ -z "${child}" ]] && continue
+    kill_tree "${child}"
+  done < <(pgrep -P "${pid}" 2>/dev/null || true)
+  kill "${pid}" >/dev/null 2>&1 || true
+}
+
+kill_tree_force() {
+  local pid=$1
+  local child
+  if ! kill -0 "${pid}" >/dev/null 2>&1; then
+    return 0
+  fi
+  while read -r child; do
+    [[ -z "${child}" ]] && continue
+    kill_tree_force "${child}"
+  done < <(pgrep -P "${pid}" 2>/dev/null || true)
+  kill -9 "${pid}" >/dev/null 2>&1 || true
+}
+
 cleanup() {
   for pid in "${PIDS[@]:-}"; do
-    if kill -0 "${pid}" >/dev/null 2>&1; then
-      kill "${pid}" >/dev/null 2>&1 || true
-    fi
+    kill_tree "${pid}"
   done
-  sleep 2
+  sleep "${CLEANUP_GRACE_SECONDS:-5}"
   for pid in "${PIDS[@]:-}"; do
-    if kill -0 "${pid}" >/dev/null 2>&1; then
-      kill -9 "${pid}" >/dev/null 2>&1 || true
-    fi
+    kill_tree_force "${pid}"
   done
 }
 trap cleanup EXIT
+
+is_port_free() {
+  local host=$1
+  local port=$2
+  python3 - "${host}" "${port}" <<'PY'
+import socket
+import sys
+
+host = sys.argv[1]
+port = int(sys.argv[2])
+bind_host = "0.0.0.0" if host in ("0.0.0.0", "127.0.0.1", "localhost") else host
+
+sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+try:
+    sock.bind((bind_host, port))
+except OSError:
+    sys.exit(1)
+finally:
+    sock.close()
+sys.exit(0)
+PY
+}
+
+check_ports_free() {
+  local occupied=0
+  local port
+  for port in "${PREFILL_PORT}" "${DECODE_PORT}" "${PROXY_PORT}" \
+    "${PREFILL_SIDE_CHANNEL_PORT}" "${DECODE_SIDE_CHANNEL_PORT}"; do
+    if ! is_port_free "${HOST}" "${port}"; then
+      echo "Port ${port} is already in use" >&2
+      if command -v ss >/dev/null 2>&1; then
+        ss -ltnp "sport = :${port}" >&2 || true
+      elif command -v netstat >/dev/null 2>&1; then
+        netstat -ltnp 2>/dev/null | grep ":${port}" >&2 || true
+      fi
+      occupied=1
+    fi
+  done
+  if (( occupied != 0 )); then
+    return 1
+  fi
+}
+
+wait_for_ports_free() {
+  local waited=0
+  local timeout_sec=${CLEANUP_TIMEOUT_SECONDS:-120}
+  while ! check_ports_free >/dev/null 2>&1; do
+    sleep 1
+    waited=$((waited + 1))
+    if (( waited >= timeout_sec )); then
+      echo "Timed out waiting for PD experiment ports to become free" >&2
+      check_ports_free || true
+      return 1
+    fi
+  done
+}
 
 wait_for_server() {
   local port=$1
@@ -179,11 +257,63 @@ run_benchmark_case() {
   write_case_event "${case_dir}" "bench_case_end" "${case_id}" "${input_len}" "${output_len}" "${concurrency}" "${num_prompts}" "${sleep_ms}"
 }
 
+selected_sleep_values() {
+  if [[ -n "${BENCH_CASES:-}" ]]; then
+    local case_spec input_len output_len concurrency sleep_ms
+    for case_spec in ${BENCH_CASES}; do
+      IFS=',' read -r input_len output_len concurrency sleep_ms <<< "${case_spec}"
+      if [[ -z "${input_len}" || -z "${output_len}" || -z "${concurrency}" || -z "${sleep_ms}" ]]; then
+        echo "Invalid BENCH_CASES entry: ${case_spec}. Expected input,output,concurrency,sleep" >&2
+        return 1
+      fi
+      printf '%s\n' "${sleep_ms}"
+    done | awk '!seen[$0]++'
+  else
+    printf '%s\n' ${TRANSFER_SLEEP_MS_LIST:-0}
+  fi
+}
+
+run_benchmark_cases_for_sleep() {
+  local case_dir=$1
+  local sleep_ms=$2
+  local case_spec input_len output_len concurrency case_sleep matched
+  matched=0
+
+  if [[ -n "${BENCH_CASES:-}" ]]; then
+    for case_spec in ${BENCH_CASES}; do
+      IFS=',' read -r input_len output_len concurrency case_sleep <<< "${case_spec}"
+      if [[ -z "${input_len}" || -z "${output_len}" || -z "${concurrency}" || -z "${case_sleep}" ]]; then
+        echo "Invalid BENCH_CASES entry: ${case_spec}. Expected input,output,concurrency,sleep" >&2
+        return 1
+      fi
+      if [[ "${case_sleep}" == "${sleep_ms}" ]]; then
+        run_benchmark_case "${case_dir}" "${input_len}" "${output_len}" "${concurrency}" "${sleep_ms}"
+        matched=1
+      fi
+    done
+    if (( matched == 0 )); then
+      echo "No BENCH_CASES entries matched sleep_ms=${sleep_ms}" >&2
+      return 1
+    fi
+    return 0
+  fi
+
+  for input_len in ${INPUT_LENS}; do
+    for output_len in ${OUTPUT_LENS}; do
+      for concurrency in ${CONCURRENCIES}; do
+        run_benchmark_case "${case_dir}" "${input_len}" "${output_len}" "${concurrency}" "${sleep_ms}"
+      done
+    done
+  done
+}
+
 run_sleep_case() {
   local sleep_ms=$1
   local sleep_dir_name="${sleep_ms//./p}"
   local case_dir="${RUN_ROOT}/pull/sleep-${sleep_dir_name}"
   mkdir -p "${case_dir}"
+
+  check_ports_free
 
   start_vllm_server "prefill" "${PREFILL_PORT}" "${PREFILL_SIDE_CHANNEL_PORT}" "${PREFILL_ENGINE_ID}" \
     "${PREFILL_DEVICES}" "${case_dir}/prefill.trace.jsonl" "${case_dir}/prefill.log" "${sleep_ms}"
@@ -195,22 +325,18 @@ run_sleep_case() {
   start_proxy "${case_dir}/proxy.trace.jsonl" "${case_dir}/proxy.log"
   wait_for_proxy
 
-  for input_len in ${INPUT_LENS}; do
-    for output_len in ${OUTPUT_LENS}; do
-      for concurrency in ${CONCURRENCIES}; do
-        run_benchmark_case "${case_dir}" "${input_len}" "${output_len}" "${concurrency}" "${sleep_ms}"
-      done
-    done
-  done
+  run_benchmark_cases_for_sleep "${case_dir}" "${sleep_ms}"
 
   cleanup
   PIDS=()
+  wait_for_ports_free
 }
 
 echo "Results will be saved to ${RUN_ROOT}"
-for sleep_ms in ${TRANSFER_SLEEP_MS_LIST:-0}; do
+while read -r sleep_ms; do
+  [[ -z "${sleep_ms}" ]] && continue
   run_sleep_case "${sleep_ms}"
-done
+done < <(selected_sleep_values)
 
 echo "Done. Parse traces with:"
 echo "  python tests/pd_transfer/parse_pd_trace.py ${RUN_ROOT}"
