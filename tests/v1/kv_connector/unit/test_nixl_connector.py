@@ -939,6 +939,38 @@ def test_kv_buffer_to_nixl_memory_types(dist_init, kv_buffer_device,
         assert connector.connector_worker.nixl_memory_type == nixl_memory_type
 
 
+def test_pd_transfer_delay_is_non_blocking():
+    worker = object.__new__(NixlConnectorWorker)
+    worker._pd_transfer_sleep_ms = 80
+    worker._delayed_recving_transfers = {}
+    worker.nixl_wrapper = FakeNixlWrapper("test")
+    worker.xfer_stats = NixlKVConnectorStats()
+    transfers = {
+        "req1": [(1, 0.0)],
+        "req2": [(2, 0.0)],
+    }
+    clock_values = [10.0, 10.0, 10.079, 10.081]
+    module = "vllm.distributed.kv_transfer.kv_connector.v1.nixl_connector"
+
+    with patch(f"{module}.time.perf_counter",
+               side_effect=clock_values), \
+            patch(f"{module}.time.sleep") as sleep_mock, \
+            patch(f"{module}.trace_event"):
+        assert worker._pop_done_transfers(transfers) == set()
+        assert transfers == {}
+        deadlines = {
+            ready_at
+            for ready_at, _ in worker._delayed_recving_transfers.values()
+        }
+        assert len(deadlines) == 1
+
+        assert worker._pop_done_transfers(transfers) == set()
+        assert worker._pop_done_transfers(transfers) == {"req1", "req2"}
+
+    sleep_mock.assert_not_called()
+    assert worker._delayed_recving_transfers == {}
+
+
 @patch(
     "vllm.distributed.kv_transfer.kv_connector.v1.nixl_connector.NixlWrapper",
     FakeNixlWrapper)

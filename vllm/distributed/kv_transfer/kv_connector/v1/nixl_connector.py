@@ -566,6 +566,10 @@ class NixlConnectorWorker:
         # [req_id -> list[handle]]
         self._recving_metadata: dict[ReqId, ReqMeta] = {}
         self._recving_transfers = defaultdict[ReqId, list[Transfer]](list)
+        # Transfers that are physically complete but intentionally not ready.
+        # Map of request id -> (ready time, number of transfer handles).
+        self._delayed_recving_transfers: dict[
+            ReqId, tuple[float, int]] = {}
         # Track the expiration time of requests that are waiting to be sent.
         self._reqs_to_send: dict[ReqId, float] = {}
         # Set of requests that have been part of a batch, regardless of status.
@@ -1172,7 +1176,8 @@ class NixlConnectorWorker:
         Returns:
             set of req_ids that have all done xfers
         """
-        done_req_ids: set[str] = set()
+        done_req_ids = self._pop_delayed_recv_transfers()
+        newly_done: list[tuple[str, int]] = []
         for req_id, handles in list(transfers.items()):
             in_progress = False
             for handle, _xfer_stime in handles:
@@ -1188,13 +1193,23 @@ class NixlConnectorWorker:
                     raise RuntimeError("Transfer failed with state %s",
                                        xfer_state)
             if not in_progress:
-                self._trace_recv_transfer_done(req_id, len(handles))
-                done_req_ids.add(req_id)
+                newly_done.append((req_id, len(handles)))
                 del transfers[req_id]
-        return done_req_ids
 
-    def _trace_recv_transfer_done(self, req_id: str, num_handles: int) -> None:
-        if self._pd_transfer_sleep_ms > 0:
+        if not newly_done:
+            return done_req_ids
+
+        if self._pd_transfer_sleep_ms <= 0:
+            for req_id, num_handles in newly_done:
+                self._trace_recv_transfer_done(req_id, num_handles)
+                done_req_ids.add(req_id)
+            return done_req_ids
+
+        # All transfers observed in this poll get the same deadline. The worker
+        # remains available to poll and process other requests in the meantime.
+        ready_at = (time.perf_counter() +
+                    self._pd_transfer_sleep_ms / 1000.0)
+        for req_id, num_handles in newly_done:
             trace_event(
                 "pull_transfer_sleep_start",
                 req_id,
@@ -1202,7 +1217,22 @@ class NixlConnectorWorker:
                 sleep_ms=self._pd_transfer_sleep_ms,
                 num_handles=num_handles,
             )
-            time.sleep(self._pd_transfer_sleep_ms / 1000.0)
+            previous = self._delayed_recving_transfers.get(req_id)
+            if previous is None:
+                self._delayed_recving_transfers[req_id] = (ready_at,
+                                                           num_handles)
+            else:
+                self._delayed_recving_transfers[req_id] = (
+                    max(previous[0], ready_at), previous[1] + num_handles)
+        return done_req_ids
+
+    def _pop_delayed_recv_transfers(self) -> set[str]:
+        now = time.perf_counter()
+        done_req_ids: set[str] = set()
+        for req_id, (ready_at, num_handles) in list(
+                self._delayed_recving_transfers.items()):
+            if now < ready_at:
+                continue
             trace_event(
                 "pull_transfer_sleep_end",
                 req_id,
@@ -1210,7 +1240,12 @@ class NixlConnectorWorker:
                 sleep_ms=self._pd_transfer_sleep_ms,
                 num_handles=num_handles,
             )
+            self._trace_recv_transfer_done(req_id, num_handles)
+            done_req_ids.add(req_id)
+            del self._delayed_recving_transfers[req_id]
+        return done_req_ids
 
+    def _trace_recv_transfer_done(self, req_id: str, num_handles: int) -> None:
         trace_event(
             "pull_transfer_end",
             req_id,
@@ -1465,6 +1500,7 @@ class NixlConnectorWorker:
             for handle, _ in handles:
                 self.nixl_wrapper.release_xfer_handle(handle)
         self._recving_transfers.clear()
+        self._delayed_recving_transfers.clear()
         if self.src_xfer_side_handle:
             self.nixl_wrapper.release_dlist_handle(self.src_xfer_side_handle)
             self.src_xfer_side_handle = 0

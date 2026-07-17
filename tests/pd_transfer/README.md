@@ -46,3 +46,18 @@ The parser writes:
 
 This v0.11 branch has NIXL pull support only; push-mode comparison is not part
 of this harness.
+
+## Visualization
+
+`plot_pd_transfer.py` reads benchmark JSON files directly and writes PNG figures
+plus `plot_summary.csv` under `<run-id>/plots` by default. It produces:
+
+- `01_sleep_sweep`: fixed input and concurrency, varying injected sleep
+- `02_concurrency_sweep`: fixed input and sleep, varying concurrency
+- `03_input_sweep`: fixed sleep and concurrency, varying input length
+- `04_proportional_extrapolation`: fixed sleep/input ratio, plotted as the
+  change against the corresponding `sleep=0` baseline
+
+The first three chart types show mean TTFT, p99 TTFT, and request throughput.
+The extrapolation charts show baseline-relative TTFT deltas and request
+throughput percentage change. Use `--output-dir <path>` to place artifacts elsewhere.
