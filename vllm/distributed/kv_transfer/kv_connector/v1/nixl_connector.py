@@ -27,7 +27,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     CopyBlocksOp, KVConnectorBase_V1, KVConnectorMetadata, KVConnectorRole)
 from vllm.distributed.kv_transfer.kv_connector.v1.metrics import (
     KVConnectorStats)
-from vllm.distributed.kv_transfer.pd_trace import trace_event
+from vllm.distributed.kv_transfer.pd_trace import is_trace_enabled, trace_event
 from vllm.distributed.parallel_state import (
     get_tensor_model_parallel_rank, get_tensor_model_parallel_world_size,
     get_tp_group)
@@ -99,6 +99,38 @@ class ReqMeta:
     remote_port: int
     remote_engine_id: str
     tp_size: int
+
+
+@dataclass
+class _NixlTransferTraceState:
+    """Low-overhead, request-local timestamps for PD transfer analysis."""
+
+    remote_engine_id: str
+    num_local_blocks: int
+    num_remote_blocks: int
+    kv_load_start_ns: int
+    handshake_cached: Optional[bool] = None
+    handshake_start_ns: Optional[int] = None
+    handshake_end_ns: Optional[int] = None
+    desc_build_start_ns: Optional[int] = None
+    desc_build_end_ns: Optional[int] = None
+    desc_build_total_ns: int = 0
+    xfer_prepare_start_ns: Optional[int] = None
+    xfer_prepare_end_ns: Optional[int] = None
+    xfer_prepare_total_ns: int = 0
+    xfer_submit_start_ns: Optional[int] = None
+    xfer_submit_end_ns: Optional[int] = None
+    xfer_submit_total_ns: int = 0
+    first_poll_ns: Optional[int] = None
+    done_observed_ns: Optional[int] = None
+    connector_finished_ns: Optional[int] = None
+    poll_rounds: int = 0
+    proc_checks: int = 0
+    num_handles: int = 0
+    num_local_descs: int = 0
+    num_remote_descs: int = 0
+    total_bytes: int = 0
+    transfer_skipped: bool = False
 
 
 class NixlConnectorMetadata(KVConnectorMetadata):
@@ -354,6 +386,14 @@ class NixlConnectorScheduler:
                     # send_notif in _read_blocks to free the memory on the P.
                     local_block_ids = (blocks.get_unhashed_block_ids()
                                        if num_external_tokens > 0 else [])
+                    trace_event(
+                        "pull_decode_kv_allocated",
+                        request.request_id,
+                        role="decode",
+                        num_external_tokens=num_external_tokens,
+                        num_local_blocks=len(local_block_ids),
+                        num_remote_blocks=len(params["remote_block_ids"]),
+                    )
                     # Get unhashed blocks to pull from remote.
                     self._reqs_need_recv[request.request_id] = (
                         request, local_block_ids)
@@ -568,8 +608,12 @@ class NixlConnectorWorker:
         self._recving_transfers = defaultdict[ReqId, list[Transfer]](list)
         # Transfers that are physically complete but intentionally not ready.
         # Map of request id -> (ready time, number of transfer handles).
-        self._delayed_recving_transfers: dict[
-            ReqId, tuple[float, int]] = {}
+        self._delayed_recving_transfers: dict[ReqId, tuple[float, int]] = {}
+        # Detailed timing is collected only for explicit PD trace runs. Each
+        # request emits one summary record after the connector reports it done.
+        self._pd_trace_enabled = is_trace_enabled()
+        self._transfer_trace_states: dict[ReqId, _NixlTransferTraceState] = {}
+        self._transfer_trace_lock = threading.Lock()
         # Track the expiration time of requests that are waiting to be sent.
         self._reqs_to_send: dict[ReqId, float] = {}
         # Set of requests that have been part of a batch, regardless of status.
@@ -721,6 +765,7 @@ class NixlConnectorWorker:
     def _background_nixl_handshake(self, req_id: str,
                                    remote_engine_id: EngineId, meta: ReqMeta):
         # Do NIXL handshake in background and add to _ready_requests when done.
+        self._record_handshake_start(req_id)
         fut = self._handshake_futures.get(remote_engine_id)
         if fut is None:
             fut = self._handshake_initiation_executor.submit(
@@ -741,6 +786,7 @@ class NixlConnectorWorker:
         # TODO: handle failure state of future in the
         # callback, we want to fail the request in this case.
         def request_ready(_f: Future[Any], entry=(req_id, meta)):
+            self._record_handshake_end(req_id)
             self._ready_requests.put(entry)
 
         fut.add_done_callback(request_ready)
@@ -1101,6 +1147,195 @@ class NixlConnectorWorker:
             self.copy_blocks(self.device_kv_caches, self.host_xfer_buffers,
                              meta.local_block_ids, meta.local_block_ids, "d2h")
 
+    def _start_transfer_trace(self, req_id: str, meta: ReqMeta) -> None:
+        if not self._pd_trace_enabled:
+            return
+        now_ns = time.perf_counter_ns()
+        with self._transfer_trace_lock:
+            state = self._transfer_trace_states.get(req_id)
+            if state is None:
+                self._transfer_trace_states[req_id] = \
+                    _NixlTransferTraceState(
+                        remote_engine_id=meta.remote_engine_id,
+                        num_local_blocks=0,
+                        num_remote_blocks=0,
+                        kv_load_start_ns=now_ns,
+                    )
+
+    def _record_handshake_start(self, req_id: str) -> None:
+        if not self._pd_trace_enabled:
+            return
+        now_ns = time.perf_counter_ns()
+        with self._transfer_trace_lock:
+            state = self._transfer_trace_states.get(req_id)
+            if state is not None:
+                state.handshake_cached = False
+                if state.handshake_start_ns is None:
+                    state.handshake_start_ns = now_ns
+
+    def _record_handshake_end(self, req_id: str) -> None:
+        if not self._pd_trace_enabled:
+            return
+        now_ns = time.perf_counter_ns()
+        with self._transfer_trace_lock:
+            state = self._transfer_trace_states.get(req_id)
+            if state is not None:
+                state.handshake_end_ns = now_ns
+
+    def _record_cached_handshake(self, req_id: str) -> None:
+        if not self._pd_trace_enabled:
+            return
+        with self._transfer_trace_lock:
+            state = self._transfer_trace_states.get(req_id)
+            if state is not None:
+                state.handshake_cached = True
+
+    def _record_trace_phase(self, req_id: str, phase: str, start_ns: int,
+                            end_ns: int) -> None:
+        if not self._pd_trace_enabled:
+            return
+        with self._transfer_trace_lock:
+            state = self._transfer_trace_states.get(req_id)
+            if state is None:
+                return
+            start_field = f"{phase}_start_ns"
+            end_field = f"{phase}_end_ns"
+            total_field = f"{phase}_total_ns"
+            if getattr(state, start_field) is None:
+                setattr(state, start_field, start_ns)
+            setattr(state, end_field, end_ns)
+            setattr(state, total_field,
+                    getattr(state, total_field) + end_ns - start_ns)
+
+    def _record_transfer_shape(self, req_id: str, num_local_blocks: int,
+                               num_remote_blocks: int, num_local_descs: int,
+                               num_remote_descs: int,
+                               total_bytes: int) -> None:
+        if not self._pd_trace_enabled:
+            return
+        with self._transfer_trace_lock:
+            state = self._transfer_trace_states.get(req_id)
+            if state is None:
+                return
+            state.num_local_blocks += num_local_blocks
+            state.num_remote_blocks += num_remote_blocks
+            state.num_local_descs += num_local_descs
+            state.num_remote_descs += num_remote_descs
+            state.total_bytes += total_bytes
+            state.num_handles += 1
+
+    def _record_transfer_poll(self, req_id: str, proc_checks: int,
+                              done: bool) -> None:
+        if not self._pd_trace_enabled:
+            return
+        now_ns = time.perf_counter_ns()
+        with self._transfer_trace_lock:
+            state = self._transfer_trace_states.get(req_id)
+            if state is None:
+                return
+            if state.first_poll_ns is None:
+                state.first_poll_ns = now_ns
+            state.poll_rounds += 1
+            state.proc_checks += proc_checks
+            if done:
+                state.done_observed_ns = now_ns
+
+    def _record_transfer_skipped(self, req_id: str) -> None:
+        if not self._pd_trace_enabled:
+            return
+        now_ns = time.perf_counter_ns()
+        with self._transfer_trace_lock:
+            state = self._transfer_trace_states.get(req_id)
+            if state is not None:
+                state.transfer_skipped = True
+                state.done_observed_ns = now_ns
+
+    def _get_transfer_nbytes(self, local_block_ids: list[int]) -> int:
+        """Return bytes represented by the selected local descriptors."""
+        if not self.block_window_per_layer:
+            return len(local_block_ids) * sum(self.block_len_per_layer)
+
+        total_bytes = 0
+        for layer_idx, block_window in enumerate(self.block_window_per_layer):
+            num_blocks = (len(local_block_ids) if block_window is None else
+                          min(len(local_block_ids), block_window))
+            if self._use_flashinfer:
+                layer_bytes = self.block_len_per_layer[layer_idx]
+            elif self.num_layers < self.num_regions:
+                first_region = 2 * layer_idx
+                layer_bytes = sum(
+                    self.block_len_per_layer[first_region:first_region + 2])
+            else:
+                layer_bytes = self.block_len_per_layer[layer_idx]
+            total_bytes += num_blocks * layer_bytes
+        return total_bytes
+
+    def _emit_transfer_trace(self, req_id: str) -> None:
+        if not self._pd_trace_enabled:
+            return
+        now_ns = time.perf_counter_ns()
+        with self._transfer_trace_lock:
+            state = self._transfer_trace_states.pop(req_id, None)
+            if state is None:
+                return
+            state.connector_finished_ns = now_ns
+
+        def elapsed_ms(start_ns: Optional[int],
+                       end_ns: Optional[int]) -> Optional[float]:
+            if start_ns is None or end_ns is None:
+                return None
+            return round((end_ns - start_ns) / 1_000_000, 6)
+
+        trace_event(
+            "pull_transfer_profile",
+            req_id,
+            role="decode",
+            tp_rank=self.tp_rank,
+            remote_engine_id=state.remote_engine_id,
+            handshake_cached=state.handshake_cached,
+            num_local_blocks=state.num_local_blocks,
+            num_remote_blocks=state.num_remote_blocks,
+            num_local_descs=state.num_local_descs,
+            num_remote_descs=state.num_remote_descs,
+            num_handles=state.num_handles,
+            total_bytes=state.total_bytes,
+            transfer_skipped=state.transfer_skipped,
+            poll_rounds=state.poll_rounds,
+            proc_checks=state.proc_checks,
+            injected_sleep_ms=self._pd_transfer_sleep_ms,
+            kv_load_start_perf_ns=state.kv_load_start_ns,
+            handshake_start_perf_ns=state.handshake_start_ns,
+            handshake_end_perf_ns=state.handshake_end_ns,
+            desc_build_start_perf_ns=state.desc_build_start_ns,
+            desc_build_end_perf_ns=state.desc_build_end_ns,
+            xfer_prepare_start_perf_ns=state.xfer_prepare_start_ns,
+            xfer_prepare_end_perf_ns=state.xfer_prepare_end_ns,
+            xfer_submit_start_perf_ns=state.xfer_submit_start_ns,
+            xfer_submit_end_perf_ns=state.xfer_submit_end_ns,
+            first_poll_perf_ns=state.first_poll_ns,
+            xfer_done_observed_perf_ns=state.done_observed_ns,
+            connector_finished_perf_ns=state.connector_finished_ns,
+            handshake_wait_ms=elapsed_ms(state.handshake_start_ns,
+                                         state.handshake_end_ns),
+            desc_build_ms=round(state.desc_build_total_ns / 1_000_000, 6),
+            xfer_prepare_ms=round(state.xfer_prepare_total_ns / 1_000_000, 6),
+            xfer_submit_ms=round(state.xfer_submit_total_ns / 1_000_000, 6),
+            kv_load_to_desc_build_ms=elapsed_ms(state.kv_load_start_ns,
+                                                state.desc_build_start_ns),
+            handshake_to_desc_build_ms=elapsed_ms(state.handshake_end_ns,
+                                                  state.desc_build_start_ns),
+            prepare_to_submit_gap_ms=elapsed_ms(state.xfer_prepare_end_ns,
+                                                state.xfer_submit_start_ns),
+            submit_to_done_observed_ms=elapsed_ms(state.xfer_submit_end_ns,
+                                                  state.done_observed_ns),
+            first_poll_delay_ms=elapsed_ms(state.xfer_submit_end_ns,
+                                           state.first_poll_ns),
+            done_to_connector_finished_ms=elapsed_ms(
+                state.done_observed_ns, state.connector_finished_ns),
+            kv_load_to_connector_finished_ms=elapsed_ms(
+                state.kv_load_start_ns, state.connector_finished_ns),
+        )
+
     def get_finished(self) -> tuple[set[str], set[str]]:
         """
         Get requests that are done sending or recving on this specific worker.
@@ -1120,6 +1355,9 @@ class NixlConnectorWorker:
                 meta = self._recving_metadata.pop(req_id)
                 assert meta, f"{req_id} not found in recving_metadata list"
                 self.sync_recved_kv_to_device(req_id, meta)
+
+        for req_id in done_recving:
+            self._emit_transfer_trace(req_id)
 
         # Handle timeout to avoid stranding blocks on remote.
         now = time.perf_counter()
@@ -1180,6 +1418,7 @@ class NixlConnectorWorker:
         newly_done: list[tuple[str, int]] = []
         for req_id, handles in list(transfers.items()):
             in_progress = False
+            proc_checks = 0
             for handle, _xfer_stime in handles:
                 xfer_state = self.nixl_wrapper.check_xfer_state(handle)
                 if xfer_state == "DONE":
@@ -1188,6 +1427,7 @@ class NixlConnectorWorker:
                     self.xfer_stats.record_transfer()
                 elif xfer_state == "PROC":
                     in_progress = True
+                    proc_checks += 1
                     continue
                 else:
                     raise RuntimeError("Transfer failed with state %s",
@@ -1195,6 +1435,10 @@ class NixlConnectorWorker:
             if not in_progress:
                 newly_done.append((req_id, len(handles)))
                 del transfers[req_id]
+            if self._pd_trace_enabled:
+                self._record_transfer_poll(req_id,
+                                           proc_checks,
+                                           done=not in_progress)
 
         if not newly_done:
             return done_req_ids
@@ -1207,8 +1451,7 @@ class NixlConnectorWorker:
 
         # All transfers observed in this poll get the same deadline. The worker
         # remains available to poll and process other requests in the meantime.
-        ready_at = (time.perf_counter() +
-                    self._pd_transfer_sleep_ms / 1000.0)
+        ready_at = (time.perf_counter() + self._pd_transfer_sleep_ms / 1000.0)
         for req_id, num_handles in newly_done:
             trace_event(
                 "pull_transfer_sleep_start",
@@ -1222,8 +1465,8 @@ class NixlConnectorWorker:
                 self._delayed_recving_transfers[req_id] = (ready_at,
                                                            num_handles)
             else:
-                self._delayed_recving_transfers[req_id] = (
-                    max(previous[0], ready_at), previous[1] + num_handles)
+                self._delayed_recving_transfers[req_id] = (max(
+                    previous[0], ready_at), previous[1] + num_handles)
         return done_req_ids
 
     def _pop_delayed_recv_transfers(self) -> set[str]:
@@ -1276,6 +1519,7 @@ class NixlConnectorWorker:
         """
         for req_id, meta in metadata.reqs_to_recv.items():
             remote_engine_id = meta.remote_engine_id
+            self._start_transfer_trace(req_id, meta)
             logger.debug(
                 "start_load_kv for request %s from remote engine %s. "
                 "Num local_block_ids: %s. Num remote_block_ids: %s. ", req_id,
@@ -1292,6 +1536,7 @@ class NixlConnectorWorker:
                         continue
 
             # Handshake already completed, start async read xfer.
+            self._record_cached_handshake(req_id)
             self._read_blocks_for_req(req_id, meta)
 
         # Start transfers for requests whose handshakes have now finished.
@@ -1349,6 +1594,8 @@ class NixlConnectorWorker:
             remote_rank = self.tp_rank // tp_ratio
             agent_name = self._remote_agents[dst_engine_id][remote_rank]
             self.nixl_wrapper.send_notif(agent_name, notif_msg=notif_id)
+            self._record_transfer_skipped(request_id)
+            self._emit_transfer_trace(request_id)
             return
 
         # Partial prefix cache hit: just read uncomputed blocks.
@@ -1366,6 +1613,8 @@ class NixlConnectorWorker:
         # workers will issue xfers to parts of the P worker remote kv caches.
 
         # Get descs ids.
+        desc_build_start_ns = (time.perf_counter_ns()
+                               if self._pd_trace_enabled else 0)
         local_block_descs_ids: np.ndarray
         remote_block_descs_ids: np.ndarray
         if not self.block_window_per_layer:
@@ -1405,8 +1654,14 @@ class NixlConnectorWorker:
             remote_block_descs_ids = np.concatenate(remote_descs_list)
 
         assert len(local_block_descs_ids) == len(remote_block_descs_ids)
+        if self._pd_trace_enabled:
+            self._record_trace_phase(request_id,
+                                     "desc_build", desc_build_start_ns,
+                                     time.perf_counter_ns())
 
         # Prepare transfer with Nixl.
+        xfer_prepare_start_ns = (time.perf_counter_ns()
+                                 if self._pd_trace_enabled else 0)
         handle = self.nixl_wrapper.make_prepped_xfer(
             "READ",
             local_xfer_side_handle,
@@ -1415,6 +1670,18 @@ class NixlConnectorWorker:
             remote_block_descs_ids,
             notif_msg=notif_id,
         )
+        if self._pd_trace_enabled:
+            self._record_trace_phase(request_id, "xfer_prepare",
+                                     xfer_prepare_start_ns,
+                                     time.perf_counter_ns())
+            self._record_transfer_shape(
+                request_id,
+                num_local_blocks=len(local_block_ids),
+                num_remote_blocks=len(remote_block_ids),
+                num_local_descs=len(local_block_descs_ids),
+                num_remote_descs=len(remote_block_descs_ids),
+                total_bytes=self._get_transfer_nbytes(local_block_ids),
+            )
 
         # Begin async xfer.
         trace_event(
@@ -1427,7 +1694,13 @@ class NixlConnectorWorker:
             num_local_descs=len(local_block_descs_ids),
             num_remote_descs=len(remote_block_descs_ids),
         )
+        xfer_submit_start_ns = (time.perf_counter_ns()
+                                if self._pd_trace_enabled else 0)
         self.nixl_wrapper.transfer(handle)
+        if self._pd_trace_enabled:
+            self._record_trace_phase(request_id, "xfer_submit",
+                                     xfer_submit_start_ns,
+                                     time.perf_counter_ns())
 
         # Use handle to check completion in future step().
         self._recving_transfers[request_id].append(
@@ -1501,6 +1774,7 @@ class NixlConnectorWorker:
                 self.nixl_wrapper.release_xfer_handle(handle)
         self._recving_transfers.clear()
         self._delayed_recving_transfers.clear()
+        self._transfer_trace_states.clear()
         if self.src_xfer_side_handle:
             self.nixl_wrapper.release_dlist_handle(self.src_xfer_side_handle)
             self.src_xfer_side_handle = 0

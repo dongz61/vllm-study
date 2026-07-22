@@ -1266,6 +1266,11 @@ class Scheduler(SchedulerInterface):
 
         # Return that we are ready.
         self.finished_recving_kv_req_ids.remove(request.request_id)
+        trace_event("decode_remote_kv_schedulable",
+                    request.request_id,
+                    role="decode",
+                    num_computed_tokens=num_computed_tokens,
+                    num_blocks=len(block_ids))
         return True
 
     def _update_from_kv_xfer_finished(self,

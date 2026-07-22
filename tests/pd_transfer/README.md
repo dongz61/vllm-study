@@ -10,6 +10,22 @@ The instrumentation records request-level events from:
 - prefiller: prefill completion
 - decoder: NIXL READ start, transfer completion, remote KV ready
 
+For real-transfer decomposition, the decoder also emits one
+`pull_transfer_profile` record per request. The profile is accumulated in
+memory and written only after the connector reports the request complete. It
+contains:
+
+- cold/warm handshake status and handshake wait
+- descriptor-ID construction, transfer-handle preparation, and submit time
+- first poll, poll rounds, `PROC` checks, and the time DONE was observed
+- connector completion time
+- block, descriptor, handle, and byte counts
+
+`xfer_done_observed_perf_ns` is the time vLLM first observed NIXL return DONE;
+it is not a hardware-level physical-completion timestamp. Compare an isolated
+NIXL benchmark with the integrated profile before attributing this whole span
+to data movement.
+
 `VLLM_PD_TRANSFER_SLEEP_MS` injects extra delay on the decoder side after the
 NIXL receive transfer has completed and before vLLM marks the remote KV as
 ready. This is intentionally scoped to the critical path that can affect TTFT.
@@ -44,20 +60,31 @@ The parser writes:
 - `sleep_sensitivity_summary.csv`: delta against `sleep_ms=0`
 - `pd_request_timeline_ms.csv`: request-level event timeline from JSONL traces
 
+The timeline CSV merges `pull_transfer_profile` fields with scheduler events
+and derives allocation-to-load, load-to-ready, connector-to-scheduler, and
+ready-to-schedulable durations. It also assigns each request to the enclosing
+benchmark case, adding input length, output length, concurrency, and sleep.
+
 This v0.11 branch has NIXL pull support only; push-mode comparison is not part
 of this harness.
 
 ## Visualization
 
-`plot_pd_transfer.py` reads benchmark JSON files directly and writes PNG figures
-plus `plot_summary.csv` under `<run-id>/plots` by default. It produces:
+After running the trace parser, `plot_pd_transfer.py` writes PNG figures plus
+`plot_summary.csv` under `<run-id>/plots` by default:
 
 - `01_sleep_sweep`: fixed input and concurrency, varying injected sleep
-- `02_concurrency_sweep`: fixed input and sleep, varying concurrency
-- `03_input_sweep`: fixed sleep and concurrency, varying input length
-- `04_proportional_extrapolation`: fixed sleep/input ratio, plotted as the
-  change against the corresponding `sleep=0` baseline
+- `02_kv_transfer_breakdown`: one pie per benchmark case, showing the
+  mean-per-request connector time split across handshake, descriptor build,
+  NIXL preparation/submission, observed completion, and other connector work
+- `03_kv_transfer_request_share`: one pie per benchmark case, showing the
+  mean KV load-to-connector-finish time as a share of mean end-to-end request
+  time (from proxy receipt until the Decode RPC ends)
 
-The first three chart types show mean TTFT, p99 TTFT, and request throughput.
-The extrapolation charts show baseline-relative TTFT deltas and request
-throughput percentage change. Use `--output-dir <path>` to place artifacts elsewhere.
+The sleep-sweep charts show mean TTFT, p99 TTFT, and request throughput. The
+pie charts require `pd_request_timeline_ms.csv`, so run
+`parse_pd_trace.py` first. Use `--output-dir <path>` to place artifacts elsewhere.
+
+```bash
+python tests/pd_transfer/plot_pd_transfer.py results/pd_transfer/<run-id>
+```

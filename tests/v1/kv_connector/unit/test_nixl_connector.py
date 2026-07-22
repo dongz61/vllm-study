@@ -6,6 +6,7 @@ import inspect
 import os
 import tempfile
 import textwrap
+import threading
 import time
 import uuid
 from collections import defaultdict
@@ -25,7 +26,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.multi_connector import (
     MultiKVConnectorStats)
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl_connector import (
     KVConnectorRole, NixlAgentMetadata, NixlConnector, NixlConnectorMetadata,
-    NixlConnectorWorker, NixlKVConnectorStats)
+    NixlConnectorWorker, NixlKVConnectorStats, _NixlTransferTraceState)
 from vllm.distributed.kv_transfer.kv_transfer_state import (
     ensure_kv_transfer_shutdown, has_kv_transfer_group)
 from vllm.forward_context import ForwardContext
@@ -942,6 +943,7 @@ def test_kv_buffer_to_nixl_memory_types(dist_init, kv_buffer_device,
 def test_pd_transfer_delay_is_non_blocking():
     worker = object.__new__(NixlConnectorWorker)
     worker._pd_transfer_sleep_ms = 80
+    worker._pd_trace_enabled = False
     worker._delayed_recving_transfers = {}
     worker.nixl_wrapper = FakeNixlWrapper("test")
     worker.xfer_stats = NixlKVConnectorStats()
@@ -969,6 +971,58 @@ def test_pd_transfer_delay_is_non_blocking():
 
     sleep_mock.assert_not_called()
     assert worker._delayed_recving_transfers == {}
+
+
+def test_pd_transfer_profile_is_emitted_once():
+    worker = object.__new__(NixlConnectorWorker)
+    worker._pd_trace_enabled = True
+    worker._pd_transfer_sleep_ms = 0
+    worker._transfer_trace_lock = threading.Lock()
+    worker.tp_rank = 0
+    worker._transfer_trace_states = {
+        "req":
+        _NixlTransferTraceState(
+            remote_engine_id="prefill",
+            num_local_blocks=2,
+            num_remote_blocks=2,
+            kv_load_start_ns=1_000_000,
+            handshake_cached=True,
+            desc_build_start_ns=2_000_000,
+            desc_build_end_ns=3_000_000,
+            desc_build_total_ns=1_000_000,
+            xfer_prepare_start_ns=3_000_000,
+            xfer_prepare_end_ns=4_000_000,
+            xfer_prepare_total_ns=1_000_000,
+            xfer_submit_start_ns=4_000_000,
+            xfer_submit_end_ns=5_000_000,
+            xfer_submit_total_ns=1_000_000,
+            first_poll_ns=5_500_000,
+            done_observed_ns=7_000_000,
+            poll_rounds=3,
+            proc_checks=2,
+            num_handles=1,
+            num_local_descs=4,
+            num_remote_descs=4,
+            total_bytes=8192,
+        )
+    }
+    module = "vllm.distributed.kv_transfer.kv_connector.v1.nixl_connector"
+
+    with patch(f"{module}.time.perf_counter_ns", return_value=8_000_000), \
+            patch(f"{module}.trace_event") as trace_mock:
+        worker._emit_transfer_trace("req")
+        worker._emit_transfer_trace("req")
+
+    trace_mock.assert_called_once()
+    args, fields = trace_mock.call_args
+    assert args == ("pull_transfer_profile", "req")
+    assert fields["handshake_cached"] is True
+    assert fields["desc_build_ms"] == 1.0
+    assert fields["submit_to_done_observed_ms"] == 2.0
+    assert fields["done_to_connector_finished_ms"] == 1.0
+    assert fields["kv_load_to_connector_finished_ms"] == 7.0
+    assert fields["total_bytes"] == 8192
+    assert worker._transfer_trace_states == {}
 
 
 @patch(
