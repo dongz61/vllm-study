@@ -80,10 +80,18 @@ After running the trace parser, `plot_pd_transfer.py` writes PNG figures plus
 - `03_kv_transfer_request_share`: one pie per benchmark case, showing the
   mean KV load-to-connector-finish time as a share of mean end-to-end request
   time (from proxy receipt until the Decode RPC ends)
+- `04_request_e2e_scatter`: one raw scatter plot per benchmark case; every
+  point is one request's end-to-end latency, ordered by proxy arrival time
+- `05_kv_transfer_scatter`: one raw scatter plot per benchmark case; every
+  point is one Decode-side KV load-to-connector-finish latency; cold handshake
+  requests are excluded by default
 
 The sleep-sweep charts show mean TTFT, p99 TTFT, and request throughput. The
 pie charts require `pd_request_timeline_ms.csv`, so run
 `parse_pd_trace.py` first. Use `--output-dir <path>` to place artifacts elsewhere.
+By default, pie charts exclude requests with a cold NIXL handshake so they
+represent steady-state transfer latency. Pass `--include-cold-handshake` to
+include startup cost instead.
 
 ```bash
 python tests/pd_transfer/plot_pd_transfer.py results/pd_transfer/<run-id>

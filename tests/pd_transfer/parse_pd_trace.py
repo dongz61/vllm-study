@@ -59,7 +59,10 @@ BENCH_RESULT_RE = re.compile(
 
 
 def normalize_request_id(request_id: Any) -> str:
-    return REQUEST_ID_SUFFIX_RE.sub("", str(request_id))
+    request_id = REQUEST_ID_SUFFIX_RE.sub("", str(request_id))
+    # The proxy uses the client request UUID while the engine internally adds
+    # a ``cmpl-`` prefix (and sometimes a rank suffix handled above).
+    return request_id.removeprefix("cmpl-")
 
 
 def req_ids(record: dict[str, Any]) -> list[str]:

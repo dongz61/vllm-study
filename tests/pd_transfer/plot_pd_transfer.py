@@ -70,7 +70,8 @@ def parse_case_name(path: Path) -> dict[str, int | float] | None:
 
 
 def run_id(root: Path, path: Path) -> str:
-    parts = path.relative_to(root).parts
+    relative_path = path.parent if path.name == "pd_request_timeline_ms.csv" else path
+    parts = relative_path.relative_to(root).parts
     return root.name if not parts or parts[0] == "pull" else parts[0]
 
 
@@ -97,11 +98,29 @@ def load_timeline_rows(root: Path) -> list[dict[str, Any]]:
     """Load parser output, retaining only requests with a transfer profile."""
     rows = []
     for path in root.rglob("pd_request_timeline_ms.csv"):
+        if not path.is_file():
+            continue
         with path.open(newline="", encoding="utf-8-sig") as timeline_file:
             for row in csv.DictReader(timeline_file):
                 if row.get("transfer_skipped", "").lower() == "true":
                     continue
                 if number(row.get("kv_load_to_connector_finished_ms")) is None:
+                    continue
+                row["run_id"] = run_id(root, path)
+                rows.append(row)
+    return rows
+
+
+def load_request_latency_rows(root: Path) -> list[dict[str, Any]]:
+    """Load one end-to-end latency sample for every traced proxy request."""
+    rows = []
+    for path in root.rglob("pd_request_timeline_ms.csv"):
+        if not path.is_file():
+            continue
+        with path.open(newline="", encoding="utf-8-sig") as timeline_file:
+            for row in csv.DictReader(timeline_file):
+                if (not row.get("case_id")
+                        or number(row.get("proxy_e2e_ms")) is None):
                     continue
                 row["run_id"] = run_id(root, path)
                 rows.append(row)
@@ -160,12 +179,94 @@ def create_sleep_sweeps(rows: list[dict[str, Any]], output_dir: Path) -> int:
     return count
 
 
+def save_request_latency_scatter(rows: list[dict[str, Any]], title: str,
+                                 destination: Path) -> None:
+    rows = sorted(rows, key=lambda row: number(
+        row.get("proxy_request_received_perf_ns")) or float("inf"))
+    x_values = list(range(1, len(rows) + 1))
+    y_values = [number(row["proxy_e2e_ms"]) for row in rows]
+    figure, axis = plt.subplots(figsize=(8, 4.8), layout="constrained")
+    axis.scatter(x_values, y_values, s=26, alpha=0.8, color="#1f77b4")
+    axis.set_title(title, fontsize=12)
+    axis.set_xlabel("Request arrival order within case")
+    axis.set_ylabel("End-to-end request latency (ms)")
+    axis.grid(True, alpha=0.3)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    figure.savefig(destination, dpi=180)
+    plt.close(figure)
+
+
+def create_request_latency_scatters(rows: list[dict[str, Any]],
+                                    output_dir: Path) -> int:
+    """Plot raw per-request end-to-end latency for every benchmark case."""
+    count = 0
+    for (run, case_id), items in grouped(rows, ("run_id", "case_id")):
+        row = items[0]
+        title = ("Raw end-to-end request latency\n"
+                 f"sleep={row['sleep_ms']} ms, input={row['input_len']}, "
+                 f"output={row['output_len']}, concurrency={row['concurrency']}, "
+                 f"requests={len(items)}")
+        save_request_latency_scatter(
+            items, title,
+            output_dir / run / "04_request_e2e_scatter" / f"{case_id}.png")
+        count += 1
+    return count
+
+
+def save_transfer_latency_scatter(rows: list[dict[str, Any]], title: str,
+                                  destination: Path) -> None:
+    rows = sorted(rows, key=lambda row: number(
+        row.get("kv_load_start_perf_ns")) or float("inf"))
+    x_values = list(range(1, len(rows) + 1))
+    y_values = [number(row["kv_load_to_connector_finished_ms"]) for row in rows]
+    figure, axis = plt.subplots(figsize=(8, 4.8), layout="constrained")
+    axis.scatter(x_values, y_values, s=26, alpha=0.8, color="#d62728")
+    axis.set_title(title, fontsize=12)
+    axis.set_xlabel("KV load start order within case")
+    axis.set_ylabel("KV load to connector finish (ms)")
+    axis.grid(True, alpha=0.3)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    figure.savefig(destination, dpi=180)
+    plt.close(figure)
+
+
+def create_transfer_latency_scatters(rows: list[dict[str, Any]],
+                                     output_dir: Path,
+                                     include_cold_handshake: bool = False) -> int:
+    """Plot raw steady-state transfer latency per case."""
+    count = 0
+    for (run, case_id), items in grouped(rows, ("run_id", "case_id")):
+        cold_excluded = 0
+        if not include_cold_handshake:
+            cold_excluded = sum(
+                row.get("handshake_cached", "").lower() == "false"
+                for row in items)
+            items = [row for row in items
+                     if row.get("handshake_cached", "").lower() != "false"]
+        if not items:
+            continue
+        row = items[0]
+        cold = sum(row.get("handshake_cached", "").lower() == "false"
+                   for row in items)
+        title = ("Raw KV transfer latency\n"
+                 f"input={row['input_len']}, output={row['output_len']}, "
+                 f"sleep={row['sleep_ms']} ms, concurrency={row['concurrency']}\n"
+                 f"profiles={len(items)}, cold handshake={cold}, "
+                 f"cold excluded={cold_excluded}")
+        save_transfer_latency_scatter(
+            items, title,
+            output_dir / run / "05_kv_transfer_scatter" / f"{case_id}.png")
+        count += 1
+    return count
+
+
 def save_pie(labels: list[str], values: list[float], title: str,
              destination: Path) -> None:
-    figure, axis = plt.subplots(figsize=(7, 5.4), layout="constrained")
-    _, _, autotexts = axis.pie(
+    total = sum(values)
+    figure, axis = plt.subplots(figsize=(10.5, 5.4))
+    wedges, _, autotexts = axis.pie(
         values,
-        labels=labels,
+        labels=None,
         autopct=lambda pct: f"{pct:.1f}%" if pct >= 3 else "",
         startangle=90,
         textprops={"fontsize": 9},
@@ -174,25 +275,47 @@ def save_pie(labels: list[str], values: list[float], title: str,
         text.set_color("white")
     axis.set_title(title, fontsize=12)
     axis.axis("equal")
+    legend_labels = [
+        f"{label}: {value:.3f} ms ({value / total * 100:.1f}%)"
+        for label, value in zip(labels, values)
+    ]
+    axis.legend(wedges, legend_labels, title="Mean per request",
+                loc="center left", bbox_to_anchor=(1.0, 0.5), fontsize=8)
     destination.parent.mkdir(parents=True, exist_ok=True)
-    figure.savefig(destination, dpi=180)
+    figure.savefig(destination, dpi=180, bbox_inches="tight")
     plt.close(figure)
 
 
-def case_label(rows: list[dict[str, Any]]) -> str:
+def case_label(rows: list[dict[str, Any]], cold_excluded: int = 0) -> str:
     row = rows[0]
+    cached = sum(row.get("handshake_cached", "").lower() == "true"
+                 for row in rows)
+    cold = sum(row.get("handshake_cached", "").lower() == "false"
+               for row in rows)
     return (f"sleep={row.get('sleep_ms', '?')} ms, "
             f"input={row.get('input_len', '?')}, "
             f"output={row.get('output_len', '?')}, "
-            f"concurrency={row.get('concurrency', '?')}")
+            f"concurrency={row.get('concurrency', '?')}\n"
+            f"profiles={len(rows)} (cold handshake={cold}, cached={cached}, "
+            f"cold excluded={cold_excluded})")
 
 
-def create_transfer_pies(rows: list[dict[str, Any]], output_dir: Path) -> int:
+def create_transfer_pies(rows: list[dict[str, Any]], output_dir: Path,
+                         include_cold_handshake: bool = False) -> int:
     """Create mean-per-request transfer breakdown and request-share pies."""
     count = 0
     fields = ("run_id", "case_id")
     for key, items in grouped(rows, fields):
         run, case_id = key
+        cold_excluded = 0
+        if not include_cold_handshake:
+            cold_excluded = sum(
+                row.get("handshake_cached", "").lower() == "false"
+                for row in items)
+            items = [row for row in items
+                     if row.get("handshake_cached", "").lower() != "false"]
+        if not items:
+            continue
         total_values = [number(row.get("kv_load_to_connector_finished_ms"))
                         for row in items]
         total_values = [value for value in total_values if value is not None]
@@ -203,8 +326,12 @@ def create_transfer_pies(rows: list[dict[str, Any]], output_dir: Path) -> int:
         labels = []
         values = []
         for field, label in TRANSFER_PHASES:
-            phase_ms = mean([value for row in items
-                             if (value := number(row.get(field))) is not None])
+            # A missing phase means this request did not execute it. Include
+            # it as zero so phase and total averages use the same population.
+            phase_ms = mean([
+                value if (value := number(row.get(field))) is not None else 0.0
+                for row in items
+            ])
             if phase_ms is not None and phase_ms > 0:
                 labels.append(label)
                 values.append(phase_ms)
@@ -215,7 +342,8 @@ def create_transfer_pies(rows: list[dict[str, Any]], output_dir: Path) -> int:
         if values:
             save_pie(
                 labels, values,
-                f"KV transfer breakdown (mean/request)\n{case_label(items)}",
+                f"KV transfer breakdown (mean/request, steady state)\n"
+                f"{case_label(items, cold_excluded)}",
                 output_dir / run / "02_kv_transfer_breakdown" /
                 f"{case_id}.png",
             )
@@ -236,8 +364,8 @@ def create_transfer_pies(rows: list[dict[str, Any]], output_dir: Path) -> int:
         save_pie(
             ["KV load to connector finish", "Other request time"],
             [transfer_ms, request_ms - transfer_ms],
-            f"KV transfer share of end-to-end request time (mean/request)\n"
-            f"{case_label(items)}",
+            f"KV transfer share of end-to-end request time "
+            f"(mean/request, steady state)\n{case_label(items, cold_excluded)}",
             output_dir / run / "03_kv_transfer_request_share" / f"{case_id}.png",
         )
         count += 1
@@ -259,6 +387,8 @@ def main() -> None:
     parser.add_argument("root", type=Path,
                         help="One result run or a directory containing result runs")
     parser.add_argument("--output-dir", type=Path, help="Default: <root>/plots")
+    parser.add_argument("--include-cold-handshake", action="store_true",
+                        help="Include requests that performed a cold NIXL handshake")
     args = parser.parse_args()
     root = args.root.resolve()
     if not root.is_dir():
@@ -271,9 +401,19 @@ def main() -> None:
     write_summary(output_dir / "plot_summary.csv", benchmark_rows)
     sleep_count = create_sleep_sweeps(benchmark_rows, output_dir)
     timeline_rows = load_timeline_rows(root)
-    pie_count = create_transfer_pies(timeline_rows, output_dir)
-    print(f"Read {len(benchmark_rows)} cases; wrote {sleep_count} sleep sweeps and "
-          f"{pie_count} transfer pie charts under {output_dir}")
+    request_latency_rows = load_request_latency_rows(root)
+    pie_count = create_transfer_pies(
+        timeline_rows, output_dir,
+        include_cold_handshake=args.include_cold_handshake)
+    scatter_count = create_request_latency_scatters(request_latency_rows,
+                                                    output_dir)
+    transfer_scatter_count = create_transfer_latency_scatters(timeline_rows,
+                                                              output_dir,
+                                                              args.include_cold_handshake)
+    print(f"Read {len(benchmark_rows)} cases; wrote {sleep_count} sleep sweeps, "
+          f"{pie_count} transfer pie charts, and {scatter_count} raw request "
+          f"scatter plots, and {transfer_scatter_count} raw transfer scatter "
+          f"plots under {output_dir}")
     if not timeline_rows:
         print("No request timelines found; run parse_pd_trace.py first to create "
               "pd_request_timeline_ms.csv before plotting transfer pies.")
