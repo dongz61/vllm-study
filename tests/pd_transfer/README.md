@@ -20,6 +20,15 @@ contains:
 - first poll, poll rounds, `PROC` checks, and the time DONE was observed
 - connector completion time
 - block, descriptor, handle, and byte counts
+- paired-forward, paired-reverse, and fragmented local/remote block runs,
+  including forward-only, reverse-only, and bidirectional theoretical range
+  counts plus the longest paired runs
+- first/last/min/max local and remote block IDs, plus block-pair analysis time
+
+A paired run preserves each local-to-remote block mapping while both block ID
+sequences advance by `+1` (forward) or `-1` (reverse). Blocks that cannot join
+either kind of run are reported as one-block fragments. The instrumentation
+does not reorder blocks or change the descriptors submitted to NIXL.
 
 `xfer_done_observed_perf_ns` is the time vLLM first observed NIXL return DONE;
 it is not a hardware-level physical-completion timestamp. Compare an isolated

@@ -26,7 +26,8 @@ from vllm.distributed.kv_transfer.kv_connector.v1.multi_connector import (
     MultiKVConnectorStats)
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl_connector import (
     KVConnectorRole, NixlAgentMetadata, NixlConnector, NixlConnectorMetadata,
-    NixlConnectorWorker, NixlKVConnectorStats, _NixlTransferTraceState)
+    NixlConnectorWorker, NixlKVConnectorStats, _analyze_block_pairs,
+    _NixlTransferTraceState)
 from vllm.distributed.kv_transfer.kv_transfer_state import (
     ensure_kv_transfer_shutdown, has_kv_transfer_group)
 from vllm.forward_context import ForwardContext
@@ -973,6 +974,108 @@ def test_pd_transfer_delay_is_non_blocking():
     assert worker._delayed_recving_transfers == {}
 
 
+@pytest.mark.parametrize(
+    "local_blocks,remote_blocks,expected",
+    [
+        ([], [], (0, 0, 0, 0, 0, 0, 0, 0)),
+        ([1], [4], (0, 0, 1, 1, 1, 1, 0, 0)),
+        ([1, 2, 3], [4, 5, 6], (1, 0, 0, 1, 3, 1, 3, 0)),
+        ([3, 2, 1], [6, 5, 4], (0, 1, 0, 3, 1, 1, 0, 3)),
+        ([1, 2, 3], [6, 5, 4], (0, 0, 3, 3, 3, 3, 0, 0)),
+        ([1, 2, 3, 10, 9, 8, 20], [4, 5, 6, 30, 29, 28, 40],
+         (1, 1, 1, 5, 5, 3, 3, 3)),
+    ],
+)
+def test_analyze_block_pairs(local_blocks, remote_blocks, expected):
+    stats = _analyze_block_pairs(local_blocks, remote_blocks)
+
+    assert (
+        stats.paired_forward_run_count,
+        stats.paired_reverse_run_count,
+        stats.paired_fragment_run_count,
+        stats.forward_only_range_count,
+        stats.reverse_only_range_count,
+        stats.theoretical_merged_range_count,
+        stats.longest_paired_forward_run,
+        stats.longest_paired_reverse_run,
+    ) == expected
+    if local_blocks:
+        assert stats.local_first_block_id == local_blocks[0]
+        assert stats.local_last_block_id == local_blocks[-1]
+        assert stats.local_min_block_id == min(local_blocks)
+        assert stats.local_max_block_id == max(local_blocks)
+        assert stats.remote_first_block_id == remote_blocks[0]
+        assert stats.remote_last_block_id == remote_blocks[-1]
+        assert stats.remote_min_block_id == min(remote_blocks)
+        assert stats.remote_max_block_id == max(remote_blocks)
+
+
+def test_analyze_block_pairs_rejects_mismatched_counts():
+    with pytest.raises(ValueError, match="counts must match"):
+        _analyze_block_pairs([1, 2], [3])
+
+
+def test_record_transfer_shape_accumulates_block_pair_stats():
+    worker = object.__new__(NixlConnectorWorker)
+    worker._pd_trace_enabled = True
+    worker._transfer_trace_lock = threading.Lock()
+    worker._transfer_trace_states = {
+        "req":
+        _NixlTransferTraceState(
+            remote_engine_id="prefill",
+            num_local_blocks=0,
+            num_remote_blocks=0,
+            kv_load_start_ns=1,
+        )
+    }
+
+    worker._record_transfer_shape(
+        "req",
+        num_local_blocks=3,
+        num_remote_blocks=3,
+        num_local_descs=6,
+        num_remote_descs=6,
+        total_bytes=1024,
+        block_pair_stats=_analyze_block_pairs([1, 2, 3], [11, 12, 13]),
+        block_pair_stats_ns=100_000,
+    )
+    worker._record_transfer_shape(
+        "req",
+        num_local_blocks=2,
+        num_remote_blocks=2,
+        num_local_descs=4,
+        num_remote_descs=4,
+        total_bytes=512,
+        block_pair_stats=_analyze_block_pairs([9, 8], [19, 18]),
+        block_pair_stats_ns=200_000,
+    )
+
+    state = worker._transfer_trace_states["req"]
+    assert state.num_handles == 2
+    assert state.num_local_blocks == 5
+    assert state.num_remote_blocks == 5
+    assert state.num_local_descs == 10
+    assert state.num_remote_descs == 10
+    assert state.total_bytes == 1536
+    assert state.block_pair_stats_total_ns == 300_000
+    assert state.paired_forward_run_count == 1
+    assert state.paired_reverse_run_count == 1
+    assert state.paired_fragment_run_count == 0
+    assert state.forward_only_range_count == 3
+    assert state.reverse_only_range_count == 4
+    assert state.theoretical_merged_range_count == 2
+    assert state.longest_paired_forward_run == 3
+    assert state.longest_paired_reverse_run == 2
+    assert state.local_first_block_id == 1
+    assert state.local_last_block_id == 8
+    assert state.local_min_block_id == 1
+    assert state.local_max_block_id == 9
+    assert state.remote_first_block_id == 11
+    assert state.remote_last_block_id == 18
+    assert state.remote_min_block_id == 11
+    assert state.remote_max_block_id == 19
+
+
 def test_pd_transfer_profile_is_emitted_once():
     worker = object.__new__(NixlConnectorWorker)
     worker._pd_trace_enabled = True
@@ -1004,6 +1107,23 @@ def test_pd_transfer_profile_is_emitted_once():
             num_local_descs=4,
             num_remote_descs=4,
             total_bytes=8192,
+            block_pair_stats_total_ns=250_000,
+            paired_forward_run_count=1,
+            paired_reverse_run_count=2,
+            paired_fragment_run_count=3,
+            forward_only_range_count=4,
+            reverse_only_range_count=5,
+            theoretical_merged_range_count=6,
+            longest_paired_forward_run=7,
+            longest_paired_reverse_run=8,
+            local_first_block_id=10,
+            local_last_block_id=11,
+            local_min_block_id=9,
+            local_max_block_id=12,
+            remote_first_block_id=20,
+            remote_last_block_id=21,
+            remote_min_block_id=19,
+            remote_max_block_id=22,
         )
     }
     module = "vllm.distributed.kv_transfer.kv_connector.v1.nixl_connector"
@@ -1022,6 +1142,17 @@ def test_pd_transfer_profile_is_emitted_once():
     assert fields["done_to_connector_finished_ms"] == 1.0
     assert fields["kv_load_to_connector_finished_ms"] == 7.0
     assert fields["total_bytes"] == 8192
+    assert fields["block_pair_stats_ms"] == 0.25
+    assert fields["paired_forward_run_count"] == 1
+    assert fields["paired_reverse_run_count"] == 2
+    assert fields["paired_fragment_run_count"] == 3
+    assert fields["forward_only_range_count"] == 4
+    assert fields["reverse_only_range_count"] == 5
+    assert fields["theoretical_merged_range_count"] == 6
+    assert fields["longest_paired_forward_run"] == 7
+    assert fields["longest_paired_reverse_run"] == 8
+    assert fields["local_first_block_id"] == 10
+    assert fields["remote_last_block_id"] == 21
     assert worker._transfer_trace_states == {}
 
 

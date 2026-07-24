@@ -101,6 +101,115 @@ class ReqMeta:
     tp_size: int
 
 
+@dataclass(frozen=True)
+class _BlockPairStats:
+    """Contiguity summary for corresponding local/remote KV blocks."""
+
+    paired_forward_run_count: int
+    paired_reverse_run_count: int
+    paired_fragment_run_count: int
+    forward_only_range_count: int
+    reverse_only_range_count: int
+    theoretical_merged_range_count: int
+    longest_paired_forward_run: int
+    longest_paired_reverse_run: int
+    local_first_block_id: Optional[int]
+    local_last_block_id: Optional[int]
+    local_min_block_id: Optional[int]
+    local_max_block_id: Optional[int]
+    remote_first_block_id: Optional[int]
+    remote_last_block_id: Optional[int]
+    remote_min_block_id: Optional[int]
+    remote_max_block_id: Optional[int]
+
+
+def _analyze_block_pairs(local_block_ids: list[int],
+                         remote_block_ids: list[int]) -> _BlockPairStats:
+    """Summarize maximal paired-contiguous runs without reordering blocks.
+
+    A forward run advances both local and remote block IDs by ``+1``. A
+    reverse run advances both by ``-1``. Every block that cannot be included
+    in either kind of run is counted as a one-block fragment. The theoretical
+    range count is the number of transfer ranges needed if both forward runs
+    and reverse runs (after pair-preserving canonicalization) can be merged.
+    """
+    if len(local_block_ids) != len(remote_block_ids):
+        raise ValueError("local and remote block ID counts must match")
+
+    num_blocks = len(local_block_ids)
+    if num_blocks == 0:
+        return _BlockPairStats(
+            paired_forward_run_count=0,
+            paired_reverse_run_count=0,
+            paired_fragment_run_count=0,
+            forward_only_range_count=0,
+            reverse_only_range_count=0,
+            theoretical_merged_range_count=0,
+            longest_paired_forward_run=0,
+            longest_paired_reverse_run=0,
+            local_first_block_id=None,
+            local_last_block_id=None,
+            local_min_block_id=None,
+            local_max_block_id=None,
+            remote_first_block_id=None,
+            remote_last_block_id=None,
+            remote_min_block_id=None,
+            remote_max_block_id=None,
+        )
+
+    # Each tuple is (direction, number of blocks), where direction is +1 for
+    # paired-forward, -1 for paired-reverse, and 0 for a singleton fragment.
+    runs: list[tuple[int, int]] = []
+    run_start = 0
+    run_direction: Optional[int] = None
+    forward_only_range_count = 1
+    reverse_only_range_count = 1
+
+    for index in range(num_blocks - 1):
+        local_delta = local_block_ids[index + 1] - local_block_ids[index]
+        remote_delta = remote_block_ids[index + 1] - remote_block_ids[index]
+        pair_direction = (local_delta if local_delta == remote_delta
+                          and local_delta in (-1, 1) else 0)
+        if pair_direction != 1:
+            forward_only_range_count += 1
+        if pair_direction != -1:
+            reverse_only_range_count += 1
+
+        if run_direction is None:
+            if pair_direction == 0:
+                runs.append((0, 1))
+                run_start = index + 1
+            else:
+                run_direction = pair_direction
+        elif pair_direction != run_direction:
+            runs.append((run_direction, index - run_start + 1))
+            run_start = index + 1
+            run_direction = None
+
+    runs.append((run_direction or 0, num_blocks - run_start))
+    forward_lengths = [length for direction, length in runs if direction == 1]
+    reverse_lengths = [length for direction, length in runs if direction == -1]
+
+    return _BlockPairStats(
+        paired_forward_run_count=len(forward_lengths),
+        paired_reverse_run_count=len(reverse_lengths),
+        paired_fragment_run_count=sum(direction == 0 for direction, _ in runs),
+        forward_only_range_count=forward_only_range_count,
+        reverse_only_range_count=reverse_only_range_count,
+        theoretical_merged_range_count=len(runs),
+        longest_paired_forward_run=max(forward_lengths, default=0),
+        longest_paired_reverse_run=max(reverse_lengths, default=0),
+        local_first_block_id=local_block_ids[0],
+        local_last_block_id=local_block_ids[-1],
+        local_min_block_id=min(local_block_ids),
+        local_max_block_id=max(local_block_ids),
+        remote_first_block_id=remote_block_ids[0],
+        remote_last_block_id=remote_block_ids[-1],
+        remote_min_block_id=min(remote_block_ids),
+        remote_max_block_id=max(remote_block_ids),
+    )
+
+
 @dataclass
 class _NixlTransferTraceState:
     """Low-overhead, request-local timestamps for PD transfer analysis."""
@@ -130,6 +239,23 @@ class _NixlTransferTraceState:
     num_local_descs: int = 0
     num_remote_descs: int = 0
     total_bytes: int = 0
+    block_pair_stats_total_ns: int = 0
+    paired_forward_run_count: int = 0
+    paired_reverse_run_count: int = 0
+    paired_fragment_run_count: int = 0
+    forward_only_range_count: int = 0
+    reverse_only_range_count: int = 0
+    theoretical_merged_range_count: int = 0
+    longest_paired_forward_run: int = 0
+    longest_paired_reverse_run: int = 0
+    local_first_block_id: Optional[int] = None
+    local_last_block_id: Optional[int] = None
+    local_min_block_id: Optional[int] = None
+    local_max_block_id: Optional[int] = None
+    remote_first_block_id: Optional[int] = None
+    remote_last_block_id: Optional[int] = None
+    remote_min_block_id: Optional[int] = None
+    remote_max_block_id: Optional[int] = None
     transfer_skipped: bool = False
 
 
@@ -1207,10 +1333,16 @@ class NixlConnectorWorker:
             setattr(state, total_field,
                     getattr(state, total_field) + end_ns - start_ns)
 
-    def _record_transfer_shape(self, req_id: str, num_local_blocks: int,
-                               num_remote_blocks: int, num_local_descs: int,
-                               num_remote_descs: int,
-                               total_bytes: int) -> None:
+    def _record_transfer_shape(
+            self,
+            req_id: str,
+            num_local_blocks: int,
+            num_remote_blocks: int,
+            num_local_descs: int,
+            num_remote_descs: int,
+            total_bytes: int,
+            block_pair_stats: Optional[_BlockPairStats] = None,
+            block_pair_stats_ns: int = 0) -> None:
         if not self._pd_trace_enabled:
             return
         with self._transfer_trace_lock:
@@ -1223,6 +1355,54 @@ class NixlConnectorWorker:
             state.num_remote_descs += num_remote_descs
             state.total_bytes += total_bytes
             state.num_handles += 1
+            if block_pair_stats is None:
+                return
+            state.block_pair_stats_total_ns += block_pair_stats_ns
+            state.paired_forward_run_count += (
+                block_pair_stats.paired_forward_run_count)
+            state.paired_reverse_run_count += (
+                block_pair_stats.paired_reverse_run_count)
+            state.paired_fragment_run_count += (
+                block_pair_stats.paired_fragment_run_count)
+            state.forward_only_range_count += (
+                block_pair_stats.forward_only_range_count)
+            state.reverse_only_range_count += (
+                block_pair_stats.reverse_only_range_count)
+            state.theoretical_merged_range_count += (
+                block_pair_stats.theoretical_merged_range_count)
+            state.longest_paired_forward_run = max(
+                state.longest_paired_forward_run,
+                block_pair_stats.longest_paired_forward_run)
+            state.longest_paired_reverse_run = max(
+                state.longest_paired_reverse_run,
+                block_pair_stats.longest_paired_reverse_run)
+
+            if block_pair_stats.local_first_block_id is not None:
+                if state.local_first_block_id is None:
+                    state.local_first_block_id = (
+                        block_pair_stats.local_first_block_id)
+                    state.remote_first_block_id = (
+                        block_pair_stats.remote_first_block_id)
+                state.local_last_block_id = (
+                    block_pair_stats.local_last_block_id)
+                state.remote_last_block_id = (
+                    block_pair_stats.remote_last_block_id)
+                state.local_min_block_id = min(
+                    value for value in (state.local_min_block_id,
+                                        block_pair_stats.local_min_block_id)
+                    if value is not None)
+                state.local_max_block_id = max(
+                    value for value in (state.local_max_block_id,
+                                        block_pair_stats.local_max_block_id)
+                    if value is not None)
+                state.remote_min_block_id = min(
+                    value for value in (state.remote_min_block_id,
+                                        block_pair_stats.remote_min_block_id)
+                    if value is not None)
+                state.remote_max_block_id = max(
+                    value for value in (state.remote_max_block_id,
+                                        block_pair_stats.remote_max_block_id)
+                    if value is not None)
 
     def _record_transfer_poll(self, req_id: str, proc_checks: int,
                               done: bool) -> None:
@@ -1299,6 +1479,25 @@ class NixlConnectorWorker:
             num_remote_descs=state.num_remote_descs,
             num_handles=state.num_handles,
             total_bytes=state.total_bytes,
+            block_pair_stats_ms=round(
+                state.block_pair_stats_total_ns / 1_000_000, 6),
+            paired_forward_run_count=state.paired_forward_run_count,
+            paired_reverse_run_count=state.paired_reverse_run_count,
+            paired_fragment_run_count=state.paired_fragment_run_count,
+            forward_only_range_count=state.forward_only_range_count,
+            reverse_only_range_count=state.reverse_only_range_count,
+            theoretical_merged_range_count=(
+                state.theoretical_merged_range_count),
+            longest_paired_forward_run=state.longest_paired_forward_run,
+            longest_paired_reverse_run=state.longest_paired_reverse_run,
+            local_first_block_id=state.local_first_block_id,
+            local_last_block_id=state.local_last_block_id,
+            local_min_block_id=state.local_min_block_id,
+            local_max_block_id=state.local_max_block_id,
+            remote_first_block_id=state.remote_first_block_id,
+            remote_last_block_id=state.remote_last_block_id,
+            remote_min_block_id=state.remote_min_block_id,
+            remote_max_block_id=state.remote_max_block_id,
             transfer_skipped=state.transfer_skipped,
             poll_rounds=state.poll_rounds,
             proc_checks=state.proc_checks,
@@ -1604,6 +1803,15 @@ class NixlConnectorWorker:
         if num_local_blocks < num_remote_blocks:
             remote_block_ids = remote_block_ids[-num_local_blocks:]
 
+        block_pair_stats: Optional[_BlockPairStats] = None
+        block_pair_stats_ns = 0
+        if self._pd_trace_enabled:
+            block_pair_stats_start_ns = time.perf_counter_ns()
+            block_pair_stats = _analyze_block_pairs(local_block_ids,
+                                                    remote_block_ids)
+            block_pair_stats_ns = (time.perf_counter_ns() -
+                                   block_pair_stats_start_ns)
+
         # Get side handles.
         local_xfer_side_handle = self.src_xfer_side_handle
         remote_xfer_side_handle = self.dst_xfer_side_handles[dst_engine_id]
@@ -1681,6 +1889,8 @@ class NixlConnectorWorker:
                 num_local_descs=len(local_block_descs_ids),
                 num_remote_descs=len(remote_block_descs_ids),
                 total_bytes=self._get_transfer_nbytes(local_block_ids),
+                block_pair_stats=block_pair_stats,
+                block_pair_stats_ns=block_pair_stats_ns,
             )
 
         # Begin async xfer.

@@ -22,6 +22,12 @@ def test_transfer_profile_is_merged_into_request_timeline(tmp_path):
             "submit_to_done_observed_ms": 4.5,
             "total_bytes": 8192,
             "poll_rounds": 3,
+            "paired_forward_run_count": 1,
+            "paired_reverse_run_count": 2,
+            "forward_only_range_count": 3,
+            "reverse_only_range_count": 5,
+            "theoretical_merged_range_count": 4,
+            "block_pair_stats_ms": 0.125,
         },
         {
             "event": "decode_remote_kv_ready",
@@ -73,6 +79,12 @@ def test_transfer_profile_is_merged_into_request_timeline(tmp_path):
     assert row["submit_to_done_observed_ms"] == 4.5
     assert row["total_bytes"] == 8192
     assert row["poll_rounds"] == 3
+    assert row["paired_forward_run_count"] == 1
+    assert row["paired_reverse_run_count"] == 2
+    assert row["forward_only_range_count"] == 3
+    assert row["reverse_only_range_count"] == 5
+    assert row["theoretical_merged_range_count"] == 4
+    assert row["block_pair_stats_ms"] == 0.125
     assert row["case_id"] == "case-8k-c1"
     assert row["input_len"] == 8192
     assert row["concurrency"] == 1
