@@ -28,7 +28,28 @@ contains:
 A paired run preserves each local-to-remote block mapping while both block ID
 sequences advance by `+1` (forward) or `-1` (reverse). Blocks that cannot join
 either kind of run are reported as one-block fragments. The instrumentation
-does not reorder blocks or change the descriptors submitted to NIXL.
+reports the original allocator order even when the experimental paired-reverse
+canonicalization described below changes the descriptor submission order.
+
+## Paired-reverse canonicalization experiment
+
+Set this in `config.env` to enable the optimization:
+
+```bash
+CANONICALIZE_REVERSE_BLOCK_PAIRS=1
+```
+
+The default is `0`. When enabled, the NIXL connector reverses both the local
+and remote block pairs inside every run where both sides advance by `-1`.
+This preserves each local-to-remote mapping while presenting `+1` contiguous
+descriptor IDs to the transport backend. No allocator or block table is
+modified.
+
+Each run writes the resolved value to `experiment_config.json`. Decoder
+`pull_transfer_profile` records also contain
+`reverse_block_pair_canonicalization_enabled`,
+`canonicalized_reverse_run_count`, and
+`canonicalized_reverse_block_count`.
 
 `xfer_done_observed_perf_ns` is the time vLLM first observed NIXL return DONE;
 it is not a hardware-level physical-completion timestamp. Compare an isolated

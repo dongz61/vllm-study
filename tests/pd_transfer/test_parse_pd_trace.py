@@ -28,6 +28,9 @@ def test_transfer_profile_is_merged_into_request_timeline(tmp_path):
             "reverse_only_range_count": 5,
             "theoretical_merged_range_count": 4,
             "block_pair_stats_ms": 0.125,
+            "reverse_block_pair_canonicalization_enabled": True,
+            "canonicalized_reverse_run_count": 2,
+            "canonicalized_reverse_block_count": 16,
         },
         {
             "event": "decode_remote_kv_ready",
@@ -85,6 +88,9 @@ def test_transfer_profile_is_merged_into_request_timeline(tmp_path):
     assert row["reverse_only_range_count"] == 5
     assert row["theoretical_merged_range_count"] == 4
     assert row["block_pair_stats_ms"] == 0.125
+    assert row["reverse_block_pair_canonicalization_enabled"] is True
+    assert row["canonicalized_reverse_run_count"] == 2
+    assert row["canonicalized_reverse_block_count"] == 16
     assert row["case_id"] == "case-8k-c1"
     assert row["input_len"] == 8192
     assert row["concurrency"] == 1

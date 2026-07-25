@@ -10,9 +10,25 @@ fi
 # shellcheck source=/dev/null
 source "${CONFIG_PATH}"
 
+case "${CANONICALIZE_REVERSE_BLOCK_PAIRS:-0}" in
+  0)
+    CANONICALIZE_REVERSE_BLOCK_PAIRS_JSON=false
+    ;;
+  1)
+    CANONICALIZE_REVERSE_BLOCK_PAIRS_JSON=true
+    ;;
+  *)
+    echo "CANONICALIZE_REVERSE_BLOCK_PAIRS must be 0 or 1" >&2
+    exit 1
+    ;;
+esac
+
 RUN_ID=$(date "+%Y%m%d-%H%M%S")
 RUN_ROOT="${RESULT_ROOT}/${RUN_ID}"
 mkdir -p "${RUN_ROOT}"
+printf '{"canonicalize_reverse_block_pairs":%s}\n' \
+  "${CANONICALIZE_REVERSE_BLOCK_PAIRS_JSON}" \
+  > "${RUN_ROOT}/experiment_config.json"
 
 PIDS=()
 
@@ -157,7 +173,7 @@ kv_config() {
   local role=$1
   local engine_id=$2
   cat <<EOF
-{"kv_connector":"NixlConnector","kv_role":"${role}","engine_id":"${engine_id}"}
+{"kv_connector":"NixlConnector","kv_role":"${role}","engine_id":"${engine_id}","kv_connector_extra_config":{"canonicalize_reverse_block_pairs":${CANONICALIZE_REVERSE_BLOCK_PAIRS_JSON}}}
 EOF
 }
 
@@ -333,6 +349,7 @@ run_sleep_case() {
 }
 
 echo "Results will be saved to ${RUN_ROOT}"
+echo "Paired-reverse block canonicalization: ${CANONICALIZE_REVERSE_BLOCK_PAIRS_JSON}"
 while read -r sleep_ms; do
   [[ -z "${sleep_ms}" ]] && continue
   run_sleep_case "${sleep_ms}"

@@ -11,7 +11,7 @@ import time
 import uuid
 from collections import defaultdict
 from typing import Optional
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 import ray
@@ -27,7 +27,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.multi_connector import (
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl_connector import (
     KVConnectorRole, NixlAgentMetadata, NixlConnector, NixlConnectorMetadata,
     NixlConnectorWorker, NixlKVConnectorStats, _analyze_block_pairs,
-    _NixlTransferTraceState)
+    _canonicalize_paired_reverse_runs, _NixlTransferTraceState)
 from vllm.distributed.kv_transfer.kv_transfer_state import (
     ensure_kv_transfer_shutdown, has_kv_transfer_group)
 from vllm.forward_context import ForwardContext
@@ -1015,6 +1015,100 @@ def test_analyze_block_pairs_rejects_mismatched_counts():
         _analyze_block_pairs([1, 2], [3])
 
 
+@pytest.mark.parametrize(
+    "local_blocks,remote_blocks,expected_local,expected_remote,"
+    "expected_runs,expected_blocks",
+    [
+        ([], [], [], [], 0, 0),
+        ([1], [11], [1], [11], 0, 0),
+        ([1, 2, 3], [11, 12, 13], [1, 2, 3], [11, 12, 13], 0, 0),
+        ([3, 2, 1], [13, 12, 11], [1, 2, 3], [11, 12, 13], 1, 3),
+        ([1, 2, 3], [13, 12, 11], [1, 2, 3], [13, 12, 11], 0, 0),
+        (
+            [1, 2, 3, 10, 9, 8, 20, 19],
+            [11, 12, 13, 30, 29, 28, 40, 41],
+            [1, 2, 3, 8, 9, 10, 20, 19],
+            [11, 12, 13, 28, 29, 30, 40, 41],
+            1,
+            3,
+        ),
+    ],
+)
+def test_canonicalize_paired_reverse_runs(local_blocks, remote_blocks,
+                                          expected_local, expected_remote,
+                                          expected_runs, expected_blocks):
+    original_pairs = list(zip(local_blocks, remote_blocks))
+
+    (submitted_local, submitted_remote, run_count,
+     block_count) = _canonicalize_paired_reverse_runs(local_blocks,
+                                                      remote_blocks)
+
+    assert submitted_local == expected_local
+    assert submitted_remote == expected_remote
+    assert run_count == expected_runs
+    assert block_count == expected_blocks
+    assert sorted(zip(submitted_local,
+                      submitted_remote)) == sorted(original_pairs)
+    assert local_blocks == [pair[0] for pair in original_pairs]
+    assert remote_blocks == [pair[1] for pair in original_pairs]
+
+
+def test_canonicalize_paired_reverse_runs_makes_runs_forward():
+    local_blocks = [1, 2, 3, 10, 9, 8, 20]
+    remote_blocks = [11, 12, 13, 30, 29, 28, 40]
+
+    submitted_local, submitted_remote, _, _ = (
+        _canonicalize_paired_reverse_runs(local_blocks, remote_blocks))
+    submitted_stats = _analyze_block_pairs(submitted_local, submitted_remote)
+
+    assert submitted_stats.paired_reverse_run_count == 0
+    assert submitted_stats.forward_only_range_count == 3
+    assert submitted_stats.theoretical_merged_range_count == 3
+
+
+def test_canonicalize_paired_reverse_runs_rejects_mismatched_counts():
+    with pytest.raises(ValueError, match="counts must match"):
+        _canonicalize_paired_reverse_runs([1, 2], [3])
+
+
+@pytest.mark.parametrize(
+    "enabled,expected_local_desc_ids,expected_remote_desc_ids",
+    [
+        (False, [3, 2, 1], [13, 12, 11]),
+        (True, [1, 2, 3], [11, 12, 13]),
+    ],
+)
+def test_read_blocks_canonicalizes_submitted_descriptor_order(
+        enabled, expected_local_desc_ids, expected_remote_desc_ids):
+    worker = object.__new__(NixlConnectorWorker)
+    worker.engine_id = "decode"
+    worker.tp_rank = 0
+    worker._tp_size = {"decode": 1, "prefill": 1}
+    worker._pd_trace_enabled = False
+    worker._canonicalize_reverse_block_pairs = enabled
+    worker.src_xfer_side_handle = 101
+    worker.dst_xfer_side_handles = {"prefill": 202}
+    worker.block_window_per_layer = []
+    worker.num_regions = 1
+    worker.dst_num_blocks = {"decode": 100, "prefill": 100}
+    worker.block_len_per_layer = [16]
+    worker._recving_transfers = defaultdict(list)
+    worker.nixl_wrapper = MagicMock()
+    worker.nixl_wrapper.make_prepped_xfer.return_value = 303
+
+    worker._read_blocks(
+        local_block_ids=[3, 2, 1],
+        remote_block_ids=[13, 12, 11],
+        dst_engine_id="prefill",
+        request_id="req",
+    )
+
+    args = worker.nixl_wrapper.make_prepped_xfer.call_args.args
+    assert args[2].tolist() == expected_local_desc_ids
+    assert args[4].tolist() == expected_remote_desc_ids
+    worker.nixl_wrapper.transfer.assert_called_once_with(303)
+
+
 def test_record_transfer_shape_accumulates_block_pair_stats():
     worker = object.__new__(NixlConnectorWorker)
     worker._pd_trace_enabled = True
@@ -1038,6 +1132,8 @@ def test_record_transfer_shape_accumulates_block_pair_stats():
         total_bytes=1024,
         block_pair_stats=_analyze_block_pairs([1, 2, 3], [11, 12, 13]),
         block_pair_stats_ns=100_000,
+        canonicalized_reverse_run_count=1,
+        canonicalized_reverse_block_count=3,
     )
     worker._record_transfer_shape(
         "req",
@@ -1048,6 +1144,8 @@ def test_record_transfer_shape_accumulates_block_pair_stats():
         total_bytes=512,
         block_pair_stats=_analyze_block_pairs([9, 8], [19, 18]),
         block_pair_stats_ns=200_000,
+        canonicalized_reverse_run_count=1,
+        canonicalized_reverse_block_count=2,
     )
 
     state = worker._transfer_trace_states["req"]
@@ -1074,6 +1172,8 @@ def test_record_transfer_shape_accumulates_block_pair_stats():
     assert state.remote_last_block_id == 18
     assert state.remote_min_block_id == 11
     assert state.remote_max_block_id == 19
+    assert state.canonicalized_reverse_run_count == 2
+    assert state.canonicalized_reverse_block_count == 5
 
 
 def test_pd_transfer_profile_is_emitted_once():
@@ -1124,6 +1224,9 @@ def test_pd_transfer_profile_is_emitted_once():
             remote_last_block_id=21,
             remote_min_block_id=19,
             remote_max_block_id=22,
+            reverse_block_pair_canonicalization_enabled=True,
+            canonicalized_reverse_run_count=2,
+            canonicalized_reverse_block_count=16,
         )
     }
     module = "vllm.distributed.kv_transfer.kv_connector.v1.nixl_connector"
@@ -1153,6 +1256,9 @@ def test_pd_transfer_profile_is_emitted_once():
     assert fields["longest_paired_reverse_run"] == 8
     assert fields["local_first_block_id"] == 10
     assert fields["remote_last_block_id"] == 21
+    assert fields["reverse_block_pair_canonicalization_enabled"] is True
+    assert fields["canonicalized_reverse_run_count"] == 2
+    assert fields["canonicalized_reverse_block_count"] == 16
     assert worker._transfer_trace_states == {}
 
 

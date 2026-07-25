@@ -210,6 +210,56 @@ def _analyze_block_pairs(local_block_ids: list[int],
     )
 
 
+def _canonicalize_paired_reverse_runs(
+    local_block_ids: list[int],
+    remote_block_ids: list[int],
+) -> tuple[list[int], list[int], int, int]:
+    """Turn paired ``-1`` runs into paired ``+1`` runs.
+
+    NIXL receives matching local and remote descriptor ID sequences. Reversing
+    both sides of a paired-reverse run preserves every local-to-remote block
+    mapping while presenting ascending contiguous descriptors to the transfer
+    backend.
+
+    Returns the submitted local and remote block lists, the number of reversed
+    runs, and the number of blocks in those runs. The input lists are returned
+    unchanged when no paired-reverse run exists.
+    """
+    if len(local_block_ids) != len(remote_block_ids):
+        raise ValueError("local and remote block ID counts must match")
+
+    reverse_runs: list[tuple[int, int]] = []
+    run_start: Optional[int] = None
+    for index in range(len(local_block_ids) - 1):
+        is_paired_reverse = (
+            local_block_ids[index + 1] - local_block_ids[index] == -1
+            and remote_block_ids[index + 1] - remote_block_ids[index] == -1)
+        if is_paired_reverse:
+            if run_start is None:
+                run_start = index
+        elif run_start is not None:
+            reverse_runs.append((run_start, index + 1))
+            run_start = None
+
+    if run_start is not None:
+        reverse_runs.append((run_start, len(local_block_ids)))
+    if not reverse_runs:
+        return local_block_ids, remote_block_ids, 0, 0
+
+    submitted_local_block_ids = list(local_block_ids)
+    submitted_remote_block_ids = list(remote_block_ids)
+    canonicalized_block_count = 0
+    for start, end in reverse_runs:
+        submitted_local_block_ids[start:end] = reversed(
+            submitted_local_block_ids[start:end])
+        submitted_remote_block_ids[start:end] = reversed(
+            submitted_remote_block_ids[start:end])
+        canonicalized_block_count += end - start
+
+    return (submitted_local_block_ids, submitted_remote_block_ids,
+            len(reverse_runs), canonicalized_block_count)
+
+
 @dataclass
 class _NixlTransferTraceState:
     """Low-overhead, request-local timestamps for PD transfer analysis."""
@@ -256,6 +306,9 @@ class _NixlTransferTraceState:
     remote_last_block_id: Optional[int] = None
     remote_min_block_id: Optional[int] = None
     remote_max_block_id: Optional[int] = None
+    reverse_block_pair_canonicalization_enabled: bool = False
+    canonicalized_reverse_run_count: int = 0
+    canonicalized_reverse_block_count: int = 0
     transfer_skipped: bool = False
 
 
@@ -644,6 +697,17 @@ class NixlConnectorWorker:
         self.vllm_config = vllm_config
         self.block_size = vllm_config.cache_config.block_size
         self._pd_transfer_sleep_ms = self._get_pd_transfer_sleep_ms()
+        canonicalize_reverse_block_pairs = (
+            vllm_config.kv_transfer_config.get_from_extra_config(
+                "canonicalize_reverse_block_pairs", False))
+        if not isinstance(canonicalize_reverse_block_pairs, bool):
+            raise ValueError(
+                "canonicalize_reverse_block_pairs must be a boolean")
+        self._canonicalize_reverse_block_pairs = (
+            canonicalize_reverse_block_pairs)
+        logger.info(
+            "NIXL paired-reverse block canonicalization is %s", "enabled"
+            if self._canonicalize_reverse_block_pairs else "disabled")
 
         self.nixl_backends = \
             vllm_config.kv_transfer_config.get_from_extra_config(
@@ -1286,6 +1350,8 @@ class NixlConnectorWorker:
                         num_local_blocks=0,
                         num_remote_blocks=0,
                         kv_load_start_ns=now_ns,
+                        reverse_block_pair_canonicalization_enabled=(
+                            self._canonicalize_reverse_block_pairs),
                     )
 
     def _record_handshake_start(self, req_id: str) -> None:
@@ -1342,7 +1408,9 @@ class NixlConnectorWorker:
             num_remote_descs: int,
             total_bytes: int,
             block_pair_stats: Optional[_BlockPairStats] = None,
-            block_pair_stats_ns: int = 0) -> None:
+            block_pair_stats_ns: int = 0,
+            canonicalized_reverse_run_count: int = 0,
+            canonicalized_reverse_block_count: int = 0) -> None:
         if not self._pd_trace_enabled:
             return
         with self._transfer_trace_lock:
@@ -1355,6 +1423,10 @@ class NixlConnectorWorker:
             state.num_remote_descs += num_remote_descs
             state.total_bytes += total_bytes
             state.num_handles += 1
+            state.canonicalized_reverse_run_count += (
+                canonicalized_reverse_run_count)
+            state.canonicalized_reverse_block_count += (
+                canonicalized_reverse_block_count)
             if block_pair_stats is None:
                 return
             state.block_pair_stats_total_ns += block_pair_stats_ns
@@ -1498,6 +1570,12 @@ class NixlConnectorWorker:
             remote_last_block_id=state.remote_last_block_id,
             remote_min_block_id=state.remote_min_block_id,
             remote_max_block_id=state.remote_max_block_id,
+            reverse_block_pair_canonicalization_enabled=(
+                state.reverse_block_pair_canonicalization_enabled),
+            canonicalized_reverse_run_count=(
+                state.canonicalized_reverse_run_count),
+            canonicalized_reverse_block_count=(
+                state.canonicalized_reverse_block_count),
             transfer_skipped=state.transfer_skipped,
             poll_rounds=state.poll_rounds,
             proc_checks=state.proc_checks,
@@ -1812,6 +1890,9 @@ class NixlConnectorWorker:
             block_pair_stats_ns = (time.perf_counter_ns() -
                                    block_pair_stats_start_ns)
 
+        canonicalized_reverse_run_count = 0
+        canonicalized_reverse_block_count = 0
+
         # Get side handles.
         local_xfer_side_handle = self.src_xfer_side_handle
         remote_xfer_side_handle = self.dst_xfer_side_handles[dst_engine_id]
@@ -1827,10 +1908,18 @@ class NixlConnectorWorker:
         remote_block_descs_ids: np.ndarray
         if not self.block_window_per_layer:
             # Default case: assume global attention
+            submitted_local_block_ids = local_block_ids
+            submitted_remote_block_ids = remote_block_ids
+            if self._canonicalize_reverse_block_pairs:
+                (submitted_local_block_ids, submitted_remote_block_ids,
+                 canonicalized_reverse_run_count,
+                 canonicalized_reverse_block_count
+                 ) = _canonicalize_paired_reverse_runs(local_block_ids,
+                                                       remote_block_ids)
             remote_block_descs_ids = self._get_block_descs_ids(
-                dst_engine_id, remote_block_ids)
+                dst_engine_id, submitted_remote_block_ids)
             local_block_descs_ids = self._get_block_descs_ids(
-                self.engine_id, local_block_ids)
+                self.engine_id, submitted_local_block_ids)
         else:
             # TODO(mgoin): remove this once we have hybrid memory allocator
             # Optimization for models with local attention (Llama 4)
@@ -1848,6 +1937,15 @@ class NixlConnectorWorker:
                     # If chunked, get the last block_window blocks
                     layer_local_block_ids = local_block_ids[-block_window:]
                     layer_remote_block_ids = remote_block_ids[-block_window:]
+
+                if self._canonicalize_reverse_block_pairs:
+                    (layer_local_block_ids, layer_remote_block_ids,
+                     layer_reverse_run_count, layer_reverse_block_count
+                     ) = _canonicalize_paired_reverse_runs(
+                         layer_local_block_ids, layer_remote_block_ids)
+                    canonicalized_reverse_run_count += layer_reverse_run_count
+                    canonicalized_reverse_block_count += (
+                        layer_reverse_block_count)
 
                 # Get descs ids for the layer.
                 layer_local_desc_ids = self._get_block_descs_ids(
@@ -1891,6 +1989,10 @@ class NixlConnectorWorker:
                 total_bytes=self._get_transfer_nbytes(local_block_ids),
                 block_pair_stats=block_pair_stats,
                 block_pair_stats_ns=block_pair_stats_ns,
+                canonicalized_reverse_run_count=(
+                    canonicalized_reverse_run_count),
+                canonicalized_reverse_block_count=(
+                    canonicalized_reverse_block_count),
             )
 
         # Begin async xfer.
