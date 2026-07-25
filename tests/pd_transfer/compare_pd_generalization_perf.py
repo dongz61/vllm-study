@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
 
-"""Aggregate paired OFF/ON BurstGPT generalization benchmark results."""
+"""Aggregate paired OFF/ON mixed-length generalization benchmark results."""
 
 import argparse
 import csv
@@ -230,48 +230,146 @@ def _write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
         writer.writerows(rows)
 
 
+def _case_window(trace_path: Path) -> tuple[int, int, str | None] | None:
+    case_trace_path = trace_path.with_name("case.trace.jsonl")
+    if not case_trace_path.is_file():
+        return None
+    starts: list[int] = []
+    ends: list[int] = []
+    case_ids: set[str] = set()
+    with case_trace_path.open("r", encoding="utf-8") as file:
+        for line in file:
+            record = json.loads(line)
+            event = record.get("event")
+            if event == "bench_case_start":
+                starts.append(int(record["ts_ns"]))
+            elif event == "bench_case_end":
+                ends.append(int(record["ts_ns"]))
+            case_id = str(record.get("case_id", ""))
+            if case_id:
+                case_ids.add(case_id)
+    if len(starts) != 1 or len(ends) != 1 or starts[0] > ends[0]:
+        raise PerformanceInputError(
+            f"{case_trace_path}: expected one valid benchmark time window")
+    if len(case_ids) > 1:
+        raise PerformanceInputError(
+            f"{case_trace_path}: benchmark events disagree on case_id")
+    return starts[0], ends[0], next(iter(case_ids), None)
+
+
+def _nearest_rank_float(
+    values: list[float],
+    percentile: float,
+) -> float | None:
+    if not values:
+        return None
+    ordered = sorted(values)
+    index = max(0, math.ceil(percentile * len(ordered)) - 1)
+    return ordered[index]
+
+
 def _summarize_diagnostic_traces(root: Path) -> list[dict[str, Any]]:
     summaries: list[dict[str, Any]] = []
     for variant in ("off", "on"):
         profiles: list[dict[str, Any]] = []
         for path in sorted((root / "diagnostic" / variant).rglob(
                 "decode.trace.jsonl")):
+            window = _case_window(path)
             with path.open("r", encoding="utf-8") as file:
                 for line in file:
                     record = json.loads(line)
                     if record.get("event") != "pull_transfer_profile":
                         continue
-                    if "warmup-" in str(record.get("request_id", "")):
+                    if window is not None:
+                        timestamp = int(record["ts_ns"])
+                        if not window[0] <= timestamp <= window[1]:
+                            continue
+                        if (
+                            window[2] is not None
+                            and window[2] not in str(
+                                record.get("request_id", ""))
+                        ):
+                            continue
+                    elif "warmup-" in str(record.get("request_id", "")):
                         continue
                     profiles.append(record)
         if not profiles:
             continue
+        local_blocks = [
+            int(item.get("num_local_blocks", 0)) for item in profiles
+        ]
+        remote_blocks = [
+            int(item.get("num_remote_blocks", 0)) for item in profiles
+        ]
+        canonicalized_blocks = [
+            int(item.get("canonicalized_reverse_block_count", 0))
+            for item in profiles
+        ]
+        for index, (local, remote, canonicalized) in enumerate(zip(
+                local_blocks, remote_blocks, canonicalized_blocks)):
+            if local < 0 or remote < 0 or canonicalized < 0:
+                raise PerformanceInputError(
+                    f"{variant} diagnostic profile {index}: "
+                    "block counts must be non-negative")
+            if canonicalized > local:
+                raise PerformanceInputError(
+                    f"{variant} diagnostic profile {index}: "
+                    f"canonicalized blocks {canonicalized} exceed "
+                    f"local blocks {local}")
+
+        reverse_request_count = sum(
+            int(item.get("paired_reverse_run_count", 0)) > 0
+            for item in profiles
+        )
+        canonicalized_request_count = sum(
+            count > 0 for count in canonicalized_blocks
+        )
+        total_local_blocks = sum(local_blocks)
+        total_canonicalized_blocks = sum(canonicalized_blocks)
+        per_request_canonicalized_fractions = [
+            canonicalized / local
+            for local, canonicalized in zip(
+                local_blocks, canonicalized_blocks)
+            if local > 0
+        ]
         summaries.append({
             "variant": variant,
             "profile_count": len(profiles),
+            "transferred_request_count": sum(
+                local > 0 for local in local_blocks),
             "forward_request_count": sum(
                 int(item.get("paired_forward_run_count", 0)) > 0
                 for item in profiles
             ),
-            "reverse_request_count": sum(
-                int(item.get("paired_reverse_run_count", 0)) > 0
-                for item in profiles
+            "reverse_request_count": reverse_request_count,
+            "reverse_request_fraction": (
+                reverse_request_count / len(profiles)),
+            "canonicalized_request_count": canonicalized_request_count,
+            "canonicalized_request_fraction": (
+                canonicalized_request_count / len(profiles)),
+            "total_local_block_count": total_local_blocks,
+            "total_remote_block_count": sum(remote_blocks),
+            "canonicalized_block_count": total_canonicalized_blocks,
+            "canonicalized_block_fraction": (
+                total_canonicalized_blocks / total_local_blocks
+                if total_local_blocks else 0.0
             ),
-            "canonicalized_request_count": sum(
-                int(item.get("canonicalized_reverse_block_count", 0)) > 0
-                for item in profiles
-            ),
-            "canonicalized_block_count": sum(
-                int(item.get("canonicalized_reverse_block_count", 0))
-                for item in profiles
-            ),
+            "p50_request_canonicalized_block_fraction":
+                _nearest_rank_float(
+                    per_request_canonicalized_fractions, 0.50),
+            "p90_request_canonicalized_block_fraction":
+                _nearest_rank_float(
+                    per_request_canonicalized_fractions, 0.90),
+            "p99_request_canonicalized_block_fraction":
+                _nearest_rank_float(
+                    per_request_canonicalized_fractions, 0.99),
         })
     return summaries
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Aggregate paired BurstGPT OFF/ON performance results.")
+        description="Aggregate paired mixed-length OFF/ON performance results.")
     parser.add_argument("root", type=Path)
     args = parser.parse_args()
 
@@ -303,10 +401,14 @@ def main() -> int:
         print(
             f"diagnostic {row['variant']}: profiles={row['profile_count']}, "
             f"forward={row['forward_request_count']}, "
-            f"reverse={row['reverse_request_count']}, "
+            f"reverse={row['reverse_request_count']} "
+            f"({row['reverse_request_fraction']:.1%}), "
             f"canonicalized_requests="
-            f"{row['canonicalized_request_count']}, "
-            f"canonicalized_blocks={row['canonicalized_block_count']}")
+            f"{row['canonicalized_request_count']} "
+            f"({row['canonicalized_request_fraction']:.1%}), "
+            f"canonicalized_blocks={row['canonicalized_block_count']}/"
+            f"{row['total_local_block_count']} "
+            f"({row['canonicalized_block_fraction']:.1%})")
 
     diagnostic_root = args.root / "diagnostic"
     if diagnostic_root.exists():

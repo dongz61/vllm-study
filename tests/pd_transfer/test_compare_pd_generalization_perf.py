@@ -5,7 +5,7 @@ import json
 import pytest
 
 from tests.pd_transfer.compare_pd_generalization_perf import (
-    METRICS, analyze_results)
+    METRICS, _summarize_diagnostic_traces, analyze_results)
 
 
 def _write_result(
@@ -135,3 +135,106 @@ def test_analyze_results_reports_workload_length_mismatch(tmp_path):
     _pairwise, _summary, problems = analyze_results(tmp_path)
 
     assert any("input_lens differs" in problem for problem in problems)
+
+
+def _write_diagnostic_trace(root, variant, profiles):
+    case_dir = root / "diagnostic" / variant / "rps-1" / "rep-1"
+    case_dir.mkdir(parents=True)
+    case_events = [
+        {
+            "event": "bench_case_start",
+            "ts_ns": 100,
+            "case_id": "formal-case",
+        },
+        {
+            "event": "bench_case_end",
+            "ts_ns": 200,
+            "case_id": "formal-case",
+        },
+    ]
+    (case_dir / "case.trace.jsonl").write_text(
+        "".join(json.dumps(row) + "\n" for row in case_events),
+        encoding="utf-8",
+    )
+    (case_dir / "decode.trace.jsonl").write_text(
+        "".join(json.dumps(row) + "\n" for row in profiles),
+        encoding="utf-8",
+    )
+
+
+def test_diagnostic_summary_reports_reverse_and_block_fractions(tmp_path):
+    common_profiles = [
+        {
+            "event": "pull_transfer_profile",
+            "ts_ns": 120,
+            "request_id": "healthcheck",
+            "num_local_blocks": 100,
+            "num_remote_blocks": 100,
+            "paired_forward_run_count": 0,
+            "paired_reverse_run_count": 1,
+            "canonicalized_reverse_block_count": 100,
+        },
+        {
+            "event": "pull_transfer_profile",
+            "ts_ns": 150,
+            "request_id": "formal-case-0",
+            "num_local_blocks": 10,
+            "num_remote_blocks": 10,
+            "paired_forward_run_count": 0,
+            "paired_reverse_run_count": 1,
+        },
+        {
+            "event": "pull_transfer_profile",
+            "ts_ns": 160,
+            "request_id": "formal-case-1",
+            "num_local_blocks": 6,
+            "num_remote_blocks": 6,
+            "paired_forward_run_count": 1,
+            "paired_reverse_run_count": 0,
+        },
+    ]
+    _write_diagnostic_trace(
+        tmp_path,
+        "off",
+        [
+            {
+                **row,
+                "canonicalized_reverse_block_count": 0,
+            }
+            for row in common_profiles
+        ],
+    )
+    _write_diagnostic_trace(
+        tmp_path,
+        "on",
+        [
+            common_profiles[0],
+            {
+                **common_profiles[1],
+                "canonicalized_reverse_block_count": 8,
+            },
+            {
+                **common_profiles[2],
+                "canonicalized_reverse_block_count": 0,
+            },
+        ],
+    )
+
+    summaries = _summarize_diagnostic_traces(tmp_path)
+
+    off = next(row for row in summaries if row["variant"] == "off")
+    on = next(row for row in summaries if row["variant"] == "on")
+    assert off["profile_count"] == 2
+    assert off["canonicalized_block_fraction"] == 0
+    assert on["profile_count"] == 2
+    assert on["reverse_request_fraction"] == pytest.approx(0.5)
+    assert on["canonicalized_request_fraction"] == pytest.approx(0.5)
+    assert on["total_local_block_count"] == 16
+    assert on["canonicalized_block_count"] == 8
+    assert on["canonicalized_block_fraction"] == pytest.approx(0.5)
+    assert on[
+        "p50_request_canonicalized_block_fraction"
+    ] == pytest.approx(0.0)
+    assert on[
+        "p90_request_canonicalized_block_fraction"
+    ] == pytest.approx(0.8)

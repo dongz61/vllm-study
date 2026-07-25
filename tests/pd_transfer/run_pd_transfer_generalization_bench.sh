@@ -10,6 +10,13 @@ fi
 # shellcheck source=/dev/null
 source "${CONFIG_PATH}"
 
+# DATASET_PATH supersedes the original BurstGPT-specific name. Keep the
+# fallback so existing local configs continue to work unchanged.
+DATASET_PATH=${DATASET_PATH:-${BURSTGPT_DATASET_PATH:-}}
+WORKLOAD_NAME=${WORKLOAD_NAME:-burstgpt-v1.1}
+WORKLOAD_SLUG=${WORKLOAD_SLUG:-burstgpt}
+DATASET_SOURCE_FORMAT=${DATASET_SOURCE_FORMAT:-burstgpt-v1.1-csv}
+
 require_value() {
   local name=$1
   if [[ -z "${!name:-}" ]]; then
@@ -31,7 +38,8 @@ for required_name in \
   MODEL SERVED_MODEL_NAME PREFILL_DEVICES DECODE_DEVICES TP_SIZE HOST \
   PREFILL_PORT DECODE_PORT PROXY_PORT PREFILL_SIDE_CHANNEL_PORT \
   DECODE_SIDE_CHANNEL_PORT PREFILL_ENGINE_ID DECODE_ENGINE_ID \
-  BURSTGPT_DATASET_PATH REQUEST_RATES NUM_PROMPTS REPETITIONS RESULT_ROOT; do
+  DATASET_PATH WORKLOAD_NAME WORKLOAD_SLUG DATASET_SOURCE_FORMAT \
+  REQUEST_RATES NUM_PROMPTS REPETITIONS RESULT_ROOT; do
   require_value "${required_name}"
 done
 
@@ -41,13 +49,18 @@ for integer_name in \
   require_positive_integer "${integer_name}"
 done
 
-if [[ ! -f "${BURSTGPT_DATASET_PATH}" ]]; then
-  echo "BurstGPT dataset not found: ${BURSTGPT_DATASET_PATH}" >&2
+if ! [[ "${WORKLOAD_SLUG}" =~ ^[A-Za-z0-9._-]+$ ]]; then
+  echo "WORKLOAD_SLUG may contain only letters, numbers, dot, underscore, and dash" >&2
   exit 1
 fi
 
-validate_burstgpt_dataset() {
-  python3 - "${BURSTGPT_DATASET_PATH}" <<'PY'
+if [[ ! -f "${DATASET_PATH}" ]]; then
+  echo "Dataset not found: ${DATASET_PATH}" >&2
+  exit 1
+fi
+
+validate_compatible_dataset() {
+  python3 - "${DATASET_PATH}" <<'PY'
 import csv
 import sys
 from pathlib import Path
@@ -58,7 +71,7 @@ with path.open("r", newline="", encoding="utf-8-sig") as file:
     try:
         header = next(reader)
     except StopIteration:
-        raise SystemExit(f"BurstGPT dataset is empty: {path}")
+        raise SystemExit(f"Dataset is empty: {path}")
 
 expected = {1: "Model", 2: "Request tokens", 3: "Response tokens"}
 problems = [
@@ -69,16 +82,17 @@ problems = [
 ]
 if problems:
     raise SystemExit(
-        "BurstGPT CSV is incompatible with the vLLM 0.11 positional loader; "
-        "use BurstGPT v1.1.\n" + "\n".join(problems)
+        "CSV is incompatible with the vLLM 0.11 positional BurstGPT loader. "
+        "Use BurstGPT v1.1 or the Mooncake conversion script.\n"
+        + "\n".join(problems)
     )
 
-print(f"Validated BurstGPT v1.1-compatible CSV: {path}")
+print(f"Validated vLLM 0.11 BurstGPT-compatible CSV: {path}")
 print(f"Columns: {header}")
 PY
 }
 
-validate_burstgpt_dataset
+validate_compatible_dataset
 
 if [[ -n "${MAX_CONCURRENCY:-}" ]]; then
   require_positive_integer MAX_CONCURRENCY
@@ -131,7 +145,10 @@ python3 - \
   "${RUN_ROOT}/run_manifest.json" \
   "${MODEL}" \
   "${SERVED_MODEL_NAME}" \
-  "${BURSTGPT_DATASET_PATH}" \
+  "${DATASET_PATH}" \
+  "${WORKLOAD_NAME}" \
+  "${WORKLOAD_SLUG}" \
+  "${DATASET_SOURCE_FORMAT}" \
   "${REQUEST_RATES}" \
   "${NUM_PROMPTS}" \
   "${REPETITIONS}" \
@@ -141,14 +158,18 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-(path, model, served_model_name, dataset_path, request_rates, num_prompts,
- repetitions, max_concurrency) = sys.argv[1:]
+(path, model, served_model_name, dataset_path, workload_name, workload_slug,
+ dataset_source_format, request_rates, num_prompts, repetitions,
+ max_concurrency) = sys.argv[1:]
 manifest = {
     "created_at": datetime.now(timezone.utc).isoformat(),
-    "workload": "burstgpt-v1.1",
+    "workload": workload_name,
+    "workload_slug": workload_slug,
     "model": model,
     "served_model_name": served_model_name,
     "dataset_path": dataset_path,
+    "dataset_source_format": dataset_source_format,
+    "vllm_dataset_loader": "burstgpt",
     "request_rates": request_rates.split(),
     "num_prompts": int(num_prompts),
     "repetitions": int(repetitions),
@@ -404,8 +425,8 @@ write_case_event() {
   local num_prompts=$8
   local ts_ns
   ts_ns=$(date +%s%N)
-  printf '{"ts_ns":%s,"role":"bench","event":"%s","case_id":"%s","mode":"pull","dataset":"burstgpt","phase":"%s","variant":"%s","repetition":%s,"request_rate":"%s","num_prompts":%s}\n' \
-    "${ts_ns}" "${event}" "${case_id}" "${phase}" "${variant}" \
+  printf '{"ts_ns":%s,"role":"bench","event":"%s","case_id":"%s","mode":"pull","dataset":"%s","phase":"%s","variant":"%s","repetition":%s,"request_rate":"%s","num_prompts":%s}\n' \
+    "${ts_ns}" "${event}" "${case_id}" "${WORKLOAD_SLUG}" "${phase}" "${variant}" \
     "${repetition}" "${request_rate}" "${num_prompts}" \
     >> "${case_dir}/case.trace.jsonl"
 }
@@ -476,7 +497,7 @@ run_formal_benchmark() {
     --host "${HOST}" \
     --port "${PROXY_PORT}" \
     --dataset-name burstgpt \
-    --dataset-path "${BURSTGPT_DATASET_PATH}" \
+    --dataset-path "${DATASET_PATH}" \
     --num-prompts "${num_prompts}" \
     --request-rate "${request_rate}" \
     "${concurrency_args[@]}" \
@@ -489,7 +510,7 @@ run_formal_benchmark() {
       "variant=${variant}" \
       "repetition=${repetition}" \
       "configured_request_rate=${request_rate}" \
-      "workload=burstgpt-v1.1" \
+      "workload=${WORKLOAD_NAME}" \
     "${ignore_eos_args[@]}" \
     --seed "${BENCH_SEED:-1024}" \
     --temperature "${BENCH_TEMPERATURE:-0}" \
@@ -511,12 +532,12 @@ run_isolated_case() {
   local slug case_id case_dir warmup_seed
 
   slug=$(rate_slug "${request_rate}")
-  case_id="burstgpt-${phase}-rps-${slug}-rep-${repetition}-${variant}"
+  case_id="${WORKLOAD_SLUG}-${phase}-rps-${slug}-rep-${repetition}-${variant}"
   case_dir="${RUN_ROOT}/${phase}/${variant}/rps-${slug}/rep-${repetition}"
   mkdir -p "${case_dir}"
 
   # Every isolated server receives the same warm-up workload. The Random
-  # prompts are separate from the formal BurstGPT workload.
+  # prompts are separate from the formal length-trace workload.
   warmup_seed=${WARMUP_SEED:-900000}
 
   check_ports_free
@@ -544,7 +565,8 @@ run_isolated_case() {
 }
 
 echo "Results will be saved to ${RUN_ROOT}"
-echo "Workload: BurstGPT v1.1, mixed input/output lengths"
+echo "Workload: ${WORKLOAD_NAME}, mixed input/output lengths"
+echo "Dataset source format: ${DATASET_SOURCE_FORMAT}"
 echo "Performance runs use vLLM defaults except required PD/topology arguments."
 
 for ((repetition = 1; repetition <= REPETITIONS; repetition++)); do

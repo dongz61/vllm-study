@@ -169,7 +169,70 @@ python tests/pd_transfer/compare_pd_generalization_perf.py \
 The analyzer verifies completed request counts, request errors, OFF/ON
 input/output length sequences, and pairing. It writes
 `generalization_pairwise.csv`, `generalization_summary.csv`, and, when
-diagnostic traces exist, `diagnostic_trace_summary.csv`.
+diagnostic traces exist, `diagnostic_trace_summary.csv`. The diagnostic
+summary includes reverse-request fraction, total local/remote blocks,
+canonicalized-block fraction, and p50/p90/p99 per-request canonicalized-block
+fractions. Diagnostic profiles are restricted to the formal benchmark time
+window, excluding health checks and Random warm-up requests.
+
+## Mooncake long-input performance
+
+Use the same isolated OFF/ON runner with a Mooncake FAST'25 length trace to
+measure the optimization when long inputs turn over the KV block pool many
+times. Download one of the official JSONL traces locally. The synthetic trace
+has the longest average input and is the recommended first mechanism test:
+
+```bash
+wget -O dataset/synthetic_trace.jsonl \
+  https://raw.githubusercontent.com/kvcache-ai/Mooncake/main/FAST25-release/traces/synthetic_trace.jsonl
+```
+
+Convert it with the standard-library-only adapter:
+
+```bash
+python tests/pd_transfer/prepare_mooncake_trace.py \
+  dataset/synthetic_trace.jsonl \
+  dataset/mooncake_synthetic_vllm.csv \
+  --max-total-tokens 40960
+```
+
+The converter writes the positional CSV consumed by the vLLM 0.11 BurstGPT
+loader and a neighboring `mooncake_synthetic_vllm.stats.json` file. It rejects
+malformed rows, filters requests whose input plus output exceeds the configured
+context limit, and prints input/output/total length statistics. Pass `--force`
+to replace an existing conversion.
+
+Only timestamps and input/output lengths are preserved. Mooncake `hash_ids`
+are intentionally not replayed, so the benchmark uses synthetic request-unique
+contents rather than reproducing prefix-cache sharing. The runner also uses its
+configured request rate instead of replaying the original timestamps. This
+keeps OFF/ON request lengths identical while isolating long-input block
+turnover.
+
+Copy both the converted CSV and the repository changes to the server, then
+prepare the separate configuration:
+
+```bash
+cp tests/pd_transfer/long_context_config.example.env \
+  tests/pd_transfer/long_context_config.env
+
+bash tests/pd_transfer/run_pd_transfer_generalization_bench.sh \
+  tests/pd_transfer/long_context_config.env
+
+python tests/pd_transfer/compare_pd_generalization_perf.py \
+  results/pd_transfer_long_context/<run-id>
+```
+
+The example's `0.1 0.2 0.4` request rates are calibration starting points, not
+portable final rates. Run a small smoke test on the target model/GPU before the
+three-repetition experiment. The long-input result is valid only when the
+diagnostic ON case reports substantial `canonicalized_block_fraction`; compare
+that fraction with the end-to-end and transfer-path improvement rather than
+assuming prompt length alone guarantees paired-reverse allocation.
+
+The runner now accepts the generic `DATASET_PATH`, `WORKLOAD_NAME`,
+`WORKLOAD_SLUG`, and `DATASET_SOURCE_FORMAT` settings. Existing configs using
+`BURSTGPT_DATASET_PATH` remain supported as a compatibility fallback.
 
 This v0.11 branch has NIXL pull support only; push-mode comparison is not part
 of this harness.
