@@ -247,10 +247,15 @@ run_benchmark_case() {
   local output_len=$3
   local concurrency=$4
   local sleep_ms=$5
-  local num_prompts=$((concurrency * NUM_FOLDS))
+  local num_prompts=${6:-$((concurrency * NUM_FOLDS))}
   local case_id="pull-sleep-${sleep_ms}-input-${input_len}-output-${output_len}-concurrency-${concurrency}"
   local result_name="${case_id}.json"
   local bench_log="${case_dir}/bench-sleep-${sleep_ms}-input-${input_len}-output-${output_len}-concurrency-${concurrency}.log"
+
+  if ! [[ "${num_prompts}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "num_prompts must be a positive integer, got: ${num_prompts}" >&2
+    return 1
+  fi
 
   echo "Benchmark pull: sleep_ms=${sleep_ms}, input=${input_len}, output=${output_len}, concurrency=${concurrency}, prompts=${num_prompts}"
   write_case_event "${case_dir}" "bench_case_start" "${case_id}" "${input_len}" "${output_len}" "${concurrency}" "${num_prompts}" "${sleep_ms}"
@@ -267,22 +272,57 @@ run_benchmark_case() {
     --num-prompts "${num_prompts}" \
     --max-concurrency "${concurrency}" \
     --save-result \
+    --save-detailed \
     --result-dir "${case_dir}" \
     --result-filename "${result_name}" \
-    ${BENCH_EXTRA_ARGS} 2>&1 | tee "${bench_log}"
+    ${BENCH_EXTRA_ARGS} \
+    --seed "${BENCH_SEED:-1024}" \
+    --temperature "${BENCH_TEMPERATURE:-0}" \
+    --request-id-prefix "${case_id}-" 2>&1 | tee "${bench_log}"
   write_case_event "${case_dir}" "bench_case_end" "${case_id}" "${input_len}" "${output_len}" "${concurrency}" "${num_prompts}" "${sleep_ms}"
+}
+
+parse_bench_case() {
+  local case_spec=$1
+  local fields
+  IFS=',' read -r -a fields <<< "${case_spec}"
+  if (( ${#fields[@]} < 4 || ${#fields[@]} > 5 )); then
+    echo "Invalid BENCH_CASES entry: ${case_spec}. Expected input,output,concurrency,sleep[,num_prompts]" >&2
+    return 1
+  fi
+
+  BENCH_CASE_INPUT_LEN=${fields[0]}
+  BENCH_CASE_OUTPUT_LEN=${fields[1]}
+  BENCH_CASE_CONCURRENCY=${fields[2]}
+  BENCH_CASE_SLEEP_MS=${fields[3]}
+  BENCH_CASE_NUM_PROMPTS=${fields[4]:-}
+
+  if ! [[ "${BENCH_CASE_INPUT_LEN}" =~ ^[1-9][0-9]*$ ]] \
+      || ! [[ "${BENCH_CASE_OUTPUT_LEN}" =~ ^[1-9][0-9]*$ ]] \
+      || ! [[ "${BENCH_CASE_CONCURRENCY}" =~ ^[1-9][0-9]*$ ]] \
+      || ! [[ "${BENCH_CASE_SLEEP_MS}" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+    echo "Invalid BENCH_CASES entry: ${case_spec}. Lengths/concurrency must be positive integers and sleep must be non-negative" >&2
+    return 1
+  fi
+
+  if [[ -z "${BENCH_CASE_NUM_PROMPTS}" ]]; then
+    if ! [[ "${NUM_FOLDS}" =~ ^[1-9][0-9]*$ ]]; then
+      echo "NUM_FOLDS must be a positive integer, got: ${NUM_FOLDS}" >&2
+      return 1
+    fi
+    BENCH_CASE_NUM_PROMPTS=$((BENCH_CASE_CONCURRENCY * NUM_FOLDS))
+  elif ! [[ "${BENCH_CASE_NUM_PROMPTS}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "Invalid num_prompts in BENCH_CASES entry: ${case_spec}" >&2
+    return 1
+  fi
 }
 
 selected_sleep_values() {
   if [[ -n "${BENCH_CASES:-}" ]]; then
-    local case_spec input_len output_len concurrency sleep_ms
+    local case_spec
     for case_spec in ${BENCH_CASES}; do
-      IFS=',' read -r input_len output_len concurrency sleep_ms <<< "${case_spec}"
-      if [[ -z "${input_len}" || -z "${output_len}" || -z "${concurrency}" || -z "${sleep_ms}" ]]; then
-        echo "Invalid BENCH_CASES entry: ${case_spec}. Expected input,output,concurrency,sleep" >&2
-        return 1
-      fi
-      printf '%s\n' "${sleep_ms}"
+      parse_bench_case "${case_spec}"
+      printf '%s\n' "${BENCH_CASE_SLEEP_MS}"
     done | awk '!seen[$0]++'
   else
     printf '%s\n' ${TRANSFER_SLEEP_MS_LIST:-0}
@@ -292,18 +332,20 @@ selected_sleep_values() {
 run_benchmark_cases_for_sleep() {
   local case_dir=$1
   local sleep_ms=$2
-  local case_spec input_len output_len concurrency case_sleep matched
+  local case_spec matched
   matched=0
 
   if [[ -n "${BENCH_CASES:-}" ]]; then
     for case_spec in ${BENCH_CASES}; do
-      IFS=',' read -r input_len output_len concurrency case_sleep <<< "${case_spec}"
-      if [[ -z "${input_len}" || -z "${output_len}" || -z "${concurrency}" || -z "${case_sleep}" ]]; then
-        echo "Invalid BENCH_CASES entry: ${case_spec}. Expected input,output,concurrency,sleep" >&2
-        return 1
-      fi
-      if [[ "${case_sleep}" == "${sleep_ms}" ]]; then
-        run_benchmark_case "${case_dir}" "${input_len}" "${output_len}" "${concurrency}" "${sleep_ms}"
+      parse_bench_case "${case_spec}"
+      if [[ "${BENCH_CASE_SLEEP_MS}" == "${sleep_ms}" ]]; then
+        run_benchmark_case \
+          "${case_dir}" \
+          "${BENCH_CASE_INPUT_LEN}" \
+          "${BENCH_CASE_OUTPUT_LEN}" \
+          "${BENCH_CASE_CONCURRENCY}" \
+          "${sleep_ms}" \
+          "${BENCH_CASE_NUM_PROMPTS}"
         matched=1
       fi
     done

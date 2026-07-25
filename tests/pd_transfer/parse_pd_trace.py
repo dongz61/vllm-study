@@ -8,6 +8,7 @@ import re
 from collections import defaultdict
 from pathlib import Path
 from typing import Any
+from uuid import UUID
 
 REQUEST_EVENTS = [
     "proxy_request_received",
@@ -59,10 +60,20 @@ BENCH_RESULT_RE = re.compile(
 
 
 def normalize_request_id(request_id: Any) -> str:
-    request_id = REQUEST_ID_SUFFIX_RE.sub("", str(request_id))
-    # The proxy uses the client request UUID while the engine internally adds
-    # a ``cmpl-`` prefix (and sometimes a rank suffix handled above).
-    return request_id.removeprefix("cmpl-")
+    request_id = str(request_id)
+    # Proxy events contain the original UUID, whose final UUID component may be
+    # all digits. Never treat that component as an engine rank suffix.
+    if not request_id.startswith("cmpl-"):
+        return request_id
+
+    # Engine events add ``cmpl-`` and may append a numeric TP-rank suffix. A
+    # valid UUID immediately after removing the prefix has no rank suffix.
+    engine_request_id = request_id.removeprefix("cmpl-")
+    try:
+        UUID(engine_request_id)
+    except ValueError:
+        return REQUEST_ID_SUFFIX_RE.sub("", engine_request_id)
+    return engine_request_id
 
 
 def req_ids(record: dict[str, Any]) -> list[str]:

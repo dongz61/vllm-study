@@ -2,19 +2,28 @@
 
 import json
 
-from tests.pd_transfer.parse_pd_trace import build_timelines
+import pytest
+
+from tests.pd_transfer.parse_pd_trace import (build_timelines,
+                                              normalize_request_id)
 
 
 def test_transfer_profile_is_merged_into_request_timeline(tmp_path):
+    request_id = "b585ea4b-9c9b-435b-a090-508219653957"
     records = [
         {
+            "event": "proxy_request_received",
+            "request_id": request_id,
+            "perf_ns": 500_000,
+        },
+        {
             "event": "pull_decode_kv_allocated",
-            "request_id": "req",
+            "request_id": f"cmpl-{request_id}-0",
             "perf_ns": 1_000_000,
         },
         {
             "event": "pull_transfer_profile",
-            "request_id": "req-0",
+            "request_id": f"cmpl-{request_id}-0",
             "perf_ns": 9_000_000,
             "kv_load_start_perf_ns": 2_000_000,
             "connector_finished_perf_ns": 8_000_000,
@@ -34,12 +43,12 @@ def test_transfer_profile_is_merged_into_request_timeline(tmp_path):
         },
         {
             "event": "decode_remote_kv_ready",
-            "request_id": "req",
+            "request_id": f"cmpl-{request_id}-0",
             "perf_ns": 10_000_000,
         },
         {
             "event": "decode_remote_kv_schedulable",
-            "request_id": "req",
+            "request_id": f"cmpl-{request_id}-0",
             "perf_ns": 11_000_000,
         },
     ]
@@ -77,7 +86,7 @@ def test_transfer_profile_is_merged_into_request_timeline(tmp_path):
 
     assert len(rows) == 1
     row = rows[0]
-    assert row["request_id"] == "req"
+    assert row["request_id"] == request_id
     assert row["desc_build_ms"] == 0.25
     assert row["submit_to_done_observed_ms"] == 4.5
     assert row["total_bytes"] == 8192
@@ -98,3 +107,26 @@ def test_transfer_profile_is_merged_into_request_timeline(tmp_path):
     assert row["kv_load_to_remote_ready_ms"] == 8.0
     assert row["connector_finished_to_remote_ready_ms"] == 2.0
     assert row["remote_ready_to_schedulable_ms"] == 1.0
+
+
+@pytest.mark.parametrize(
+    "raw_request_id,expected",
+    [
+        (
+            "b585ea4b-9c9b-435b-a090-508219653957",
+            "b585ea4b-9c9b-435b-a090-508219653957",
+        ),
+        (
+            "cmpl-b585ea4b-9c9b-435b-a090-508219653957-0",
+            "b585ea4b-9c9b-435b-a090-508219653957",
+        ),
+        (
+            "cmpl-b585ea4b-9c9b-435b-a090-508219653957",
+            "b585ea4b-9c9b-435b-a090-508219653957",
+        ),
+        ("client-request-2026", "client-request-2026"),
+        ("cmpl-client-request-2026-3", "client-request-2026"),
+    ],
+)
+def test_normalize_request_id(raw_request_id, expected):
+    assert normalize_request_id(raw_request_id) == expected

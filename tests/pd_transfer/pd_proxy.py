@@ -57,6 +57,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 
+_BENCHMARK_REQUEST_SUFFIX = "-pdreq"
+
 
 def parse_args():
     parser = argparse.ArgumentParser()
@@ -136,7 +138,11 @@ async def _stream_decode(client_info: dict[str, Any], endpoint: str,
 
 async def _handle(endpoint: str, request: Request):
     req_data = await request.json()
-    request_id = str(uuid.uuid4())
+    client_request_id = request.headers.get("x-request-id")
+    request_id = (
+        f"{client_request_id}{_BENCHMARK_REQUEST_SUFFIX}"
+        if client_request_id else str(uuid.uuid4())
+    )
     trace_event("proxy_request_received", request_id, role="proxy", mode="pull")
 
     prefill_client = _next_client(request.app, "prefill")

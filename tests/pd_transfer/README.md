@@ -73,11 +73,22 @@ By default, the runner executes the Cartesian product of `INPUT_LENS`,
 selected cases, set `BENCH_CASES` instead:
 
 ```bash
-BENCH_CASES="2048,32,1,0 2048,32,1,20 4096,32,1,0 4096,32,1,40"
+BENCH_CASES="2048,32,1,0,384 4096,32,1,0,192 8192,32,1,0,96 16384,32,1,0,48"
 ```
 
-Each entry is `input_len,output_len,concurrency,sleep_ms`. When `BENCH_CASES`
-is set, the matrix variables are ignored.
+Each entry is
+`input_len,output_len,concurrency,sleep_ms[,num_prompts]`. The optional fifth
+value controls the request count for that case. When it is omitted, the runner
+uses `concurrency * NUM_FOLDS`, preserving the previous behavior. When
+`BENCH_CASES` is set, the matrix variables are ignored.
+
+The runner saves per-request generated text and timing details in
+`<case-dir>/<case-id>.json`. It also gives every formal benchmark request a
+deterministic ID derived from the case ID and request index. The proxy adds a
+fixed non-numeric suffix before forwarding the ID to the Prefill and Decode
+servers. This keeps the logical request ID unambiguous when an engine appends a
+numeric TP-rank suffix, and allows benchmark outputs to be joined with transfer
+trace records.
 
 ```bash
 bash tests/pd_transfer/run_pd_transfer_bench.sh tests/pd_transfer/config.env
@@ -94,6 +105,25 @@ The timeline CSV merges `pull_transfer_profile` fields with scheduler events
 and derives allocation-to-load, load-to-ready, connector-to-scheduler, and
 ready-to-schedulable durations. It also assigns each request to the enclosing
 benchmark case, adding input length, output length, concurrency, and sleep.
+
+## Correctness comparison
+
+Run the trace parser for both an optimization-disabled run and an
+optimization-enabled run, then compare them:
+
+```bash
+python tests/pd_transfer/compare_pd_correctness.py \
+  results/pd_transfer/<baseline-run-id> \
+  results/pd_transfer/<optimized-run-id>
+```
+
+The comparison joins detailed benchmark outputs to transfer profiles by the
+deterministic request ID. For every formal request, it checks generated text,
+input/output lengths, errors, local/remote block and descriptor counts,
+transfer handle count, and total bytes. By default, every case must cover
+paired-forward and paired-reverse requests, and the optimized run must
+canonicalize at least one paired-reverse request. Use
+`--skip-coverage-checks` only for deliberately short diagnostic cases.
 
 This v0.11 branch has NIXL pull support only; push-mode comparison is not part
 of this harness.
