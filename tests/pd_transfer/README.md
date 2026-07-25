@@ -125,6 +125,52 @@ paired-forward and paired-reverse requests, and the optimized run must
 canonicalize at least one paired-reverse request. Use
 `--skip-coverage-checks` only for deliberately short diagnostic cases.
 
+## BurstGPT generalization performance
+
+The correctness runner above deliberately controls lengths, prefix caching,
+and eager execution. Use the separate generalization runner for paired OFF/ON
+performance measurements with mixed BurstGPT request and response lengths:
+
+```bash
+cp tests/pd_transfer/generalization_config.example.env \
+  tests/pd_transfer/generalization_config.env
+
+wget -O /data/BurstGPT_without_fails_2.csv \
+  https://github.com/HPMLL/BurstGPT/releases/download/v1.1/BurstGPT_without_fails_2.csv
+
+bash tests/pd_transfer/run_pd_transfer_generalization_bench.sh \
+  tests/pd_transfer/generalization_config.env
+```
+
+Use the BurstGPT v1.1 CSV. The vLLM 0.11 loader reads the `Model`, `Request
+tokens`, and `Response tokens` fields by column position; the runner rejects
+newer incompatible layouts before starting the model servers.
+The built-in loader selects rows whose original workload label is `GPT-4`;
+this does not restrict the model being benchmarked. It also does not filter
+requests against the tested model's context length, so any over-length request
+is treated as a failed benchmark artifact and must be removed from the input
+CSV before the final run.
+
+Each `repetition x request-rate x variant` case starts fresh P/D servers,
+executes the same separate Random warm-up, and then samples the same BurstGPT
+requests using a fixed seed. Odd repetitions run OFF then ON; even repetitions
+run ON then OFF. Main performance cases leave detailed PD tracing disabled and
+do not set model length, scheduler capacity, GPU utilization, eager execution,
+or prefix caching options. The optional diagnostic OFF/ON pair enables JSONL
+tracing separately.
+
+Aggregate the results with:
+
+```bash
+python tests/pd_transfer/compare_pd_generalization_perf.py \
+  results/pd_transfer_generalization/<run-id>
+```
+
+The analyzer verifies completed request counts, request errors, OFF/ON
+input/output length sequences, and pairing. It writes
+`generalization_pairwise.csv`, `generalization_summary.csv`, and, when
+diagnostic traces exist, `diagnostic_trace_summary.csv`.
+
 This v0.11 branch has NIXL pull support only; push-mode comparison is not part
 of this harness.
 
