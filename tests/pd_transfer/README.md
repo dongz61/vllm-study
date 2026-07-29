@@ -230,6 +230,12 @@ lengths are enforced with `--ignore-eos`, and the benchmark's duplicate
 first-prompt readiness request is disabled because the runner already checks
 P, D, and proxy health independently.
 
+Set `VARIANT_MODE=paired` (the default) for the OFF/ON comparison: odd
+repetitions run OFF then ON, while even repetitions reverse that order. Set
+`VARIANT_MODE=off` or `VARIANT_MODE=on` to run only one canonicalization
+variant, which is useful for smoke tests or workload characterization. A
+single-variant run is not compatible with the OFF/ON comparison aggregator.
+
 The runner accepts `DATASET_LOADER=mooncake` in addition to the existing
 BurstGPT path. Existing configs using `BURSTGPT_DATASET_PATH` remain supported
 as a compatibility fallback.

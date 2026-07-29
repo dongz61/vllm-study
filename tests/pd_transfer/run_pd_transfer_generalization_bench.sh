@@ -19,6 +19,9 @@ WORKLOAD_SLUG=${WORKLOAD_SLUG:-burstgpt}
 DATASET_SOURCE_FORMAT=${DATASET_SOURCE_FORMAT:-burstgpt-v1.1-csv}
 MOONCAKE_BLOCK_SIZE=${MOONCAKE_BLOCK_SIZE:-512}
 MOONCAKE_TOKEN_SEED=${MOONCAKE_TOKEN_SEED:-0}
+# paired runs OFF and ON in alternating order across repetitions.  Single
+# variant modes are useful for smoke tests and workload characterization.
+VARIANT_MODE=${VARIANT_MODE:-paired}
 
 require_value() {
   local name=$1
@@ -171,6 +174,14 @@ if [[ "${RUN_DIAGNOSTIC_TRACE:-1}" != "0" \
   echo "RUN_DIAGNOSTIC_TRACE must be 0 or 1" >&2
   exit 1
 fi
+case "${VARIANT_MODE}" in
+  off|on|paired)
+    ;;
+  *)
+    echo "VARIANT_MODE must be off, on, or paired; got: ${VARIANT_MODE}" >&2
+    exit 1
+    ;;
+esac
 
 read -r -a REQUEST_RATE_VALUES <<< "${REQUEST_RATES}"
 if (( ${#REQUEST_RATE_VALUES[@]} == 0 )); then
@@ -221,7 +232,8 @@ python3 - \
   "${REPETITIONS}" \
   "${MAX_CONCURRENCY:-}" \
   "${MOONCAKE_BLOCK_SIZE}" \
-  "${MOONCAKE_TOKEN_SEED}" <<'PY'
+  "${MOONCAKE_TOKEN_SEED}" \
+  "${VARIANT_MODE}" <<'PY'
 import json
 import sys
 from datetime import datetime, timezone
@@ -230,7 +242,7 @@ from pathlib import Path
 (path, model, served_model_name, dataset_path, workload_name, workload_slug,
  dataset_source_format, dataset_loader, request_rates, num_prompts,
  repetitions, max_concurrency, mooncake_block_size,
- mooncake_token_seed) = sys.argv[1:]
+ mooncake_token_seed, variant_mode) = sys.argv[1:]
 manifest = {
     "created_at": datetime.now(timezone.utc).isoformat(),
     "workload": workload_name,
@@ -262,7 +274,11 @@ manifest = {
         int(max_concurrency) if max_concurrency else None
     ),
     "server_configuration": "vllm-defaults-plus-required-pd-arguments",
-    "variant_order": "odd repetitions: off,on; even repetitions: on,off",
+    "variant_mode": variant_mode,
+    "variant_order": (
+        "odd repetitions: off,on; even repetitions: on,off"
+        if variant_mode == "paired" else variant_mode
+    ),
 }
 Path(path).write_text(
     json.dumps(manifest, indent=2, ensure_ascii=False) + "\n",
@@ -674,22 +690,31 @@ echo "Results will be saved to ${RUN_ROOT}"
 echo "Workload: ${WORKLOAD_NAME}, mixed input/output lengths"
 echo "Dataset loader: ${DATASET_LOADER}"
 echo "Dataset source format: ${DATASET_SOURCE_FORMAT}"
+echo "Variant mode: ${VARIANT_MODE}"
 if [[ "${DATASET_LOADER}" == "mooncake" ]]; then
   echo "REQUEST_RATES are interpreted as recorded arrival-rate multipliers."
 fi
 echo "Performance runs use vLLM defaults except required PD/topology arguments."
 
 for ((repetition = 1; repetition <= REPETITIONS; repetition++)); do
-  if (( repetition % 2 == 1 )); then
-    ordered_variants=(off on)
-    ordered_rates=("${REQUEST_RATE_VALUES[@]}")
-  else
-    ordered_variants=(on off)
-    ordered_rates=()
-    for ((index = ${#REQUEST_RATE_VALUES[@]} - 1; index >= 0; index--)); do
-      ordered_rates+=("${REQUEST_RATE_VALUES[index]}")
-    done
-  fi
+  case "${VARIANT_MODE}" in
+    off|on)
+      ordered_variants=("${VARIANT_MODE}")
+      ordered_rates=("${REQUEST_RATE_VALUES[@]}")
+      ;;
+    paired)
+      if (( repetition % 2 == 1 )); then
+        ordered_variants=(off on)
+        ordered_rates=("${REQUEST_RATE_VALUES[@]}")
+      else
+        ordered_variants=(on off)
+        ordered_rates=()
+        for ((index = ${#REQUEST_RATE_VALUES[@]} - 1; index >= 0; index--)); do
+          ordered_rates+=("${REQUEST_RATE_VALUES[index]}")
+        done
+      fi
+      ;;
+  esac
 
   for request_rate in "${ordered_rates[@]}"; do
     for variant in "${ordered_variants[@]}"; do
@@ -718,12 +743,21 @@ if [[ "${RUN_DIAGNOSTIC_TRACE:-1}" == "1" ]]; then
     echo "DIAGNOSTIC_NUM_PROMPTS must be a positive integer" >&2
     exit 1
   fi
-  for variant in off on; do
+  if [[ "${VARIANT_MODE}" == "paired" ]]; then
+    diagnostic_variants=(off on)
+  else
+    diagnostic_variants=("${VARIANT_MODE}")
+  fi
+  for variant in "${diagnostic_variants[@]}"; do
     run_isolated_case \
       "diagnostic" "${variant}" 1 "${diagnostic_rate}" \
       "${diagnostic_prompts}" 1
   done
 fi
 
-echo "Done. Aggregate OFF/ON performance with:"
-echo "  python tests/pd_transfer/compare_pd_generalization_perf.py ${RUN_ROOT}"
+if [[ "${VARIANT_MODE}" == "paired" ]]; then
+  echo "Done. Aggregate OFF/ON performance with:"
+  echo "  python tests/pd_transfer/compare_pd_generalization_perf.py ${RUN_ROOT}"
+else
+  echo "Done. Single-variant results are in ${RUN_ROOT}."
+fi
