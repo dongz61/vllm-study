@@ -180,3 +180,39 @@ def test_convert_trace_rejects_invalid_hash_count(tmp_path):
             tmp_path / "filtered.jsonl",
             max_total_tokens=40960,
         )
+
+
+def test_convert_trace_selects_request_window_after_filtering(tmp_path):
+    source = tmp_path / "source.jsonl"
+    output = tmp_path / "window.jsonl"
+    records = [
+        {
+            "timestamp": index * 10,
+            "input_length": 512,
+            "output_length": 16,
+            "hash_ids": [index],
+        }
+        for index in range(5)
+    ]
+    _write_jsonl(source, records)
+
+    summary = convert_trace(
+        source,
+        output,
+        max_total_tokens=40960,
+        start_request=2,
+        num_requests=3,
+    )
+
+    converted = [
+        json.loads(line)
+        for line in output.read_text(encoding="utf-8").splitlines()
+    ]
+    assert converted == records[1:4]
+    assert summary["eligible_rows_before_selection"] == 5
+    assert summary["selection"] == {
+        "start_request": 2,
+        "end_request": 4,
+        "num_requests": 3,
+        "indexing": "one-based-after-filtering",
+    }

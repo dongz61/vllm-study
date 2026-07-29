@@ -121,6 +121,8 @@ def convert_trace(
     *,
     max_total_tokens: int,
     block_size: int = 512,
+    start_request: int = 1,
+    num_requests: int | None = None,
     force: bool = False,
     stats_path: Path | None = None,
 ) -> dict[str, Any]:
@@ -129,6 +131,10 @@ def convert_trace(
         raise ValueError("max_total_tokens must be positive")
     if block_size <= 0:
         raise ValueError("block_size must be positive")
+    if start_request <= 0:
+        raise ValueError("start_request must be positive")
+    if num_requests is not None and num_requests <= 0:
+        raise ValueError("num_requests must be positive")
     if not source_path.is_file():
         raise FileNotFoundError(f"Mooncake trace not found: {source_path}")
 
@@ -203,6 +209,24 @@ def convert_trace(
         raise MooncakeConversionError(
             "no requests remain after validation and context-length filtering")
 
+    eligible_rows = len(accepted)
+    selection_start = start_request - 1
+    if selection_start >= eligible_rows:
+        raise MooncakeConversionError(
+            f"start_request={start_request} exceeds the "
+            f"{eligible_rows} requests remaining after filtering")
+    selection_end = (
+        eligible_rows
+        if num_requests is None
+        else selection_start + num_requests
+    )
+    if selection_end > eligible_rows:
+        raise MooncakeConversionError(
+            f"requested {num_requests} requests from start_request="
+            f"{start_request}, but only {eligible_rows - selection_start} "
+            "requests remain")
+    accepted = accepted[selection_start:selection_end]
+
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with output_path.open("w", newline="", encoding="utf-8") as output:
         if preserve_hash_ids:
@@ -233,11 +257,18 @@ def convert_trace(
             else "burstgpt-v1.1-compatible-length-trace"
         ),
         "source_rows": source_rows,
+        "eligible_rows_before_selection": eligible_rows,
         "written_rows": len(accepted),
         "filtered_non_positive_length": filtered_non_positive_length,
         "filtered_over_context_limit": filtered_over_context_limit,
         "max_total_tokens": max_total_tokens,
         "block_size": block_size,
+        "selection": {
+            "start_request": start_request,
+            "end_request": start_request + len(accepted) - 1,
+            "num_requests": len(accepted),
+            "indexing": "one-based-after-filtering",
+        },
         "input_length": _length_summary(input_lengths),
         "output_length": _length_summary(output_lengths),
         "total_length": _length_summary(total_lengths),
@@ -283,9 +314,20 @@ def main() -> int:
         help="Number of prompt tokens represented by each hash ID.",
     )
     parser.add_argument(
+        "--start-request",
+        type=int,
+        default=1,
+        help="First request to write (1-based, after length filtering).",
+    )
+    parser.add_argument(
+        "--num-requests",
+        type=int,
+        help="Number of requests to write after --start-request.",
+    )
+    parser.add_argument(
         "--force",
         action="store_true",
-        help="Replace an existing CSV and statistics file.",
+        help="Replace an existing output and statistics file.",
     )
     args = parser.parse_args()
 
@@ -295,6 +337,8 @@ def main() -> int:
             args.output,
             max_total_tokens=args.max_total_tokens,
             block_size=args.block_size,
+            start_request=args.start_request,
+            num_requests=args.num_requests,
             force=args.force,
             stats_path=args.stats_path,
         )

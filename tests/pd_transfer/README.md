@@ -204,6 +204,20 @@ neighboring statistics file records the context-limit filtering. The adapter
 rejects malformed rows, non-monotonic timestamps, and invalid hashes. Pass
 `--force` to replace an existing conversion. CSV output remains available only
 for historical length-only experiments and cannot reproduce prefix sharing.
+
+The following one-based, post-filtering window is a 1000-request Synthetic
+sample whose infinite-capacity token hit rate (59.22%) closely matches the
+complete filtered trace (59.18%):
+
+```bash
+python tests/pd_transfer/prepare_mooncake_trace.py \
+  dataset/mooncake_synthetic_filtered.jsonl \
+  dataset/mooncake_synthetic_sample_1000.jsonl \
+  --max-total-tokens 39000 \
+  --start-request 2468 \
+  --num-requests 1000
+```
+
 Use conversation as the primary real workload, toolagent as the high-reuse
 real workload, and synthetic as the public long-context stress workload. Set
 `DATASET_PATH`, `WORKLOAD_NAME`, and `WORKLOAD_SLUG` separately for each run.
@@ -221,6 +235,11 @@ bash tests/pd_transfer/run_pd_transfer_generalization_bench.sh \
 python tests/pd_transfer/compare_pd_generalization_perf.py \
   results/pd_transfer_long_context/<run-id>
 ```
+
+Both `parse_pd_trace.py` and `plot_pd_transfer.py` also accept a bare run ID,
+such as `20260729-031022`. From the current directory they recursively locate
+the one matching result directory containing `run_manifest.json`; pass the
+full path instead if more than one match exists.
 
 For the Mooncake loader, `REQUEST_RATES` are recorded arrival-rate multipliers:
 `1.0` replays native timestamps, `0.5` runs at half the recorded rate, and

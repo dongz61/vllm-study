@@ -59,6 +59,30 @@ BENCH_RESULT_RE = re.compile(
     r"(?P<concurrency>\d+)\.json$")
 
 
+def resolve_result_root(argument: Path) -> Path:
+    """Resolve a result directory or a bare run ID below the current directory."""
+    if argument.is_dir():
+        return argument.resolve()
+    if argument.parent != Path("."):
+        raise ValueError(f"Not a directory: {argument}")
+
+    matches = sorted(
+        path.resolve()
+        for path in Path.cwd().rglob(argument.name)
+        if path.is_dir() and (path / "run_manifest.json").is_file()
+    )
+    if not matches:
+        raise ValueError(
+            f"No result run named {argument.name!r} found below {Path.cwd()}"
+        )
+    if len(matches) > 1:
+        formatted = "\n  ".join(str(path) for path in matches)
+        raise ValueError(
+            f"Multiple result runs named {argument.name!r} found:\n  {formatted}"
+        )
+    return matches[0]
+
+
 def normalize_request_id(request_id: Any) -> str:
     request_id = str(request_id)
     # Proxy events contain the original UUID, whose final UUID component may be
@@ -314,9 +338,16 @@ def write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("root", type=Path)
+    parser.add_argument(
+        "root",
+        type=Path,
+        help="Result directory, or a bare run ID searched below the current directory",
+    )
     args = parser.parse_args()
-    root = args.root
+    try:
+        root = resolve_result_root(args.root)
+    except ValueError as error:
+        parser.error(str(error))
     bench_rows = parse_benchmark_results(root)
     timeline_rows = build_timelines(root)
     sensitivity_rows = summarize_sleep_sensitivity(bench_rows)

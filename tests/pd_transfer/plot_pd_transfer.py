@@ -31,6 +31,30 @@ TRANSFER_PHASES = (
 )
 
 
+def resolve_result_root(argument: Path) -> Path:
+    """Resolve a result directory or a bare run ID below the current directory."""
+    if argument.is_dir():
+        return argument.resolve()
+    if argument.parent != Path("."):
+        raise ValueError(f"Not a directory: {argument}")
+
+    matches = sorted(
+        path.resolve()
+        for path in Path.cwd().rglob(argument.name)
+        if path.is_dir() and (path / "run_manifest.json").is_file()
+    )
+    if not matches:
+        raise ValueError(
+            f"No result run named {argument.name!r} found below {Path.cwd()}"
+        )
+    if len(matches) > 1:
+        formatted = "\n  ".join(str(path) for path in matches)
+        raise ValueError(
+            f"Multiple result runs named {argument.name!r} found:\n  {formatted}"
+        )
+    return matches[0]
+
+
 def number(value: Any) -> float | None:
     try:
         return float(value)
@@ -95,13 +119,18 @@ def load_benchmark_rows(root: Path) -> list[dict[str, Any]]:
 
 
 def load_timeline_rows(root: Path) -> list[dict[str, Any]]:
-    """Load parser output, retaining only requests with a transfer profile."""
+    """Load formal benchmark requests with a transfer profile.
+
+    Warm-up requests have no case ID and must not appear in benchmark charts.
+    """
     rows = []
     for path in root.rglob("pd_request_timeline_ms.csv"):
         if not path.is_file():
             continue
         with path.open(newline="", encoding="utf-8-sig") as timeline_file:
             for row in csv.DictReader(timeline_file):
+                if not row.get("case_id"):
+                    continue
                 if row.get("transfer_skipped", "").lower() == "true":
                     continue
                 if number(row.get("kv_load_to_connector_finished_ms")) is None:
@@ -384,24 +413,31 @@ def write_summary(path: Path, rows: list[dict[str, Any]]) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("root", type=Path,
-                        help="One result run or a directory containing result runs")
+    parser.add_argument(
+        "root",
+        type=Path,
+        help="Result directory, or a bare run ID searched below the current directory",
+    )
     parser.add_argument("--output-dir", type=Path, help="Default: <root>/plots")
     parser.add_argument("--include-cold-handshake", action="store_true",
                         help="Include requests that performed a cold NIXL handshake")
     args = parser.parse_args()
-    root = args.root.resolve()
-    if not root.is_dir():
-        parser.error(f"Not a directory: {root}")
+    try:
+        root = resolve_result_root(args.root)
+    except ValueError as error:
+        parser.error(str(error))
     benchmark_rows = load_benchmark_rows(root)
-    if not benchmark_rows:
-        parser.error(f"No PD benchmark JSON files found below {root}")
+    timeline_rows = load_timeline_rows(root)
+    request_latency_rows = load_request_latency_rows(root)
+    if not benchmark_rows and not timeline_rows and not request_latency_rows:
+        parser.error(
+            f"No PD benchmark JSON files or parsed request timelines found below {root}. "
+            "Run parse_pd_trace.py first for trace-only diagnostic results."
+        )
     output_dir = (args.output_dir or root / "plots").resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     write_summary(output_dir / "plot_summary.csv", benchmark_rows)
     sleep_count = create_sleep_sweeps(benchmark_rows, output_dir)
-    timeline_rows = load_timeline_rows(root)
-    request_latency_rows = load_request_latency_rows(root)
     pie_count = create_transfer_pies(
         timeline_rows, output_dir,
         include_cold_handshake=args.include_cold_handshake)

@@ -1,0 +1,53 @@
+{
+  "source_path": "dataset\\mooncake_synthetic_filtered.jsonl",
+  "output_path": "dataset\\mooncake_synthetic_sample_1000.jsonl",
+  "format": "mooncake-fast25-jsonl",
+  "source_rows": 3613,
+  "eligible_rows_before_selection": 3613,
+  "written_rows": 1000,
+  "filtered_non_positive_length": 0,
+  "filtered_over_context_limit": 0,
+  "max_total_tokens": 39000,
+  "block_size": 512,
+  "selection": {
+    "start_request": 2468,
+    "end_request": 3467,
+    "num_requests": 1000,
+    "indexing": "one-based-after-filtering"
+  },
+  "input_length": {
+    "min": 13,
+    "mean": 13506.504,
+    "p50": 13302,
+    "p90": 31024,
+    "p99": 38350,
+    "max": 38842
+  },
+  "output_length": {
+    "min": 2,
+    "mean": 97.829,
+    "p50": 36,
+    "p90": 304,
+    "p99": 665,
+    "max": 893
+  },
+  "total_length": {
+    "min": 22,
+    "mean": 13604.333,
+    "p50": 13364,
+    "p90": 31052,
+    "p99": 38360,
+    "max": 38846
+  },
+  "infinite_capacity_prefix_reuse": {
+    "reused_tokens": 7998308,
+    "total_input_tokens": 13506504,
+    "ratio": 0.5921819591509394,
+    "requests_with_reuse": 567
+  },
+  "trace_duration_ms": 280654,
+  "timestamp_preserved": true,
+  "request_order_preserved": true,
+  "hash_ids_preserved": true,
+  "hash_ids_replayed": true
+}
