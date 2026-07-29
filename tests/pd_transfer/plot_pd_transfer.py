@@ -381,21 +381,21 @@ def create_transfer_pies(rows: list[dict[str, Any]], output_dir: Path,
         paired = []
         for row in items:
             transfer_ms = number(row.get("kv_load_to_connector_finished_ms"))
-            request_ms = number(row.get("proxy_e2e_ms"))
-            if (transfer_ms is not None and request_ms is not None
-                    and request_ms >= transfer_ms):
-                paired.append((transfer_ms, request_ms))
+            ttft_ms = number(row.get("proxy_ttft_ms"))
+            if (transfer_ms is not None and ttft_ms is not None
+                    and ttft_ms >= transfer_ms):
+                paired.append((transfer_ms, ttft_ms))
         if not paired:
             continue
         transfer_ms = mean([pair[0] for pair in paired])
-        request_ms = mean([pair[1] for pair in paired])
-        assert transfer_ms is not None and request_ms is not None
+        ttft_ms = mean([pair[1] for pair in paired])
+        assert transfer_ms is not None and ttft_ms is not None
         save_pie(
-            ["KV load to connector finish", "Other request time"],
-            [transfer_ms, request_ms - transfer_ms],
-            f"KV transfer share of end-to-end request time "
+            ["KV load to connector finish", "Other TTFT-path time"],
+            [transfer_ms, ttft_ms - transfer_ms],
+            f"KV transfer share of time to first token "
             f"(mean/request, steady state)\n{case_label(items, cold_excluded)}",
-            output_dir / run / "03_kv_transfer_request_share" / f"{case_id}.png",
+            output_dir / run / "03_kv_transfer_ttft_share" / f"{case_id}.png",
         )
         count += 1
     return count

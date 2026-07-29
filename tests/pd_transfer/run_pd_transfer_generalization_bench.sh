@@ -229,6 +229,40 @@ for request_rate in "${REQUEST_RATE_VALUES[@]}"; do
   SEEN_REQUEST_RATES["${request_rate}"]=1
 done
 
+DIAGNOSTIC_RATE_VALUES=()
+if [[ "${RUN_DIAGNOSTIC_TRACE:-1}" == "1" ]]; then
+  diagnostic_rates=${DIAGNOSTIC_REQUEST_RATES:-${DIAGNOSTIC_REQUEST_RATE:-${REQUEST_RATE_VALUES[0]}}}
+  read -r -a DIAGNOSTIC_RATE_VALUES <<< "${diagnostic_rates}"
+  if (( ${#DIAGNOSTIC_RATE_VALUES[@]} == 0 )); then
+    echo "DIAGNOSTIC_REQUEST_RATES must contain at least one value" >&2
+    exit 1
+  fi
+  declare -A SEEN_DIAGNOSTIC_RATES=()
+  for diagnostic_rate in "${DIAGNOSTIC_RATE_VALUES[@]}"; do
+    if ! [[ "${diagnostic_rate}" == "inf" \
+        || "${diagnostic_rate}" =~ ^([0-9]+([.][0-9]*)?|[.][0-9]+)$ ]]; then
+      echo "Invalid diagnostic request rate: ${diagnostic_rate}" >&2
+      exit 1
+    fi
+    if [[ "${diagnostic_rate}" != "inf" ]] \
+        && ! python3 -c "import sys; sys.exit(0 if float(sys.argv[1]) > 0 else 1)" \
+          "${diagnostic_rate}"; then
+      echo "Diagnostic request rate must be positive: ${diagnostic_rate}" >&2
+      exit 1
+    fi
+    if [[ "${DATASET_LOADER}" == "mooncake" \
+        && "${diagnostic_rate}" == "inf" ]]; then
+      echo "Mooncake diagnostic arrival-rate scale must be finite" >&2
+      exit 1
+    fi
+    if [[ -n "${SEEN_DIAGNOSTIC_RATES[${diagnostic_rate}]:-}" ]]; then
+      echo "Duplicate diagnostic request rate: ${diagnostic_rate}" >&2
+      exit 1
+    fi
+    SEEN_DIAGNOSTIC_RATES["${diagnostic_rate}"]=1
+  done
+fi
+
 RUN_ID=$(date "+%Y%m%d-%H%M%S")
 RUN_ROOT="${RESULT_ROOT}/${RUN_ID}"
 mkdir -p "${RUN_ROOT}"
@@ -248,7 +282,8 @@ python3 - \
   "${MAX_CONCURRENCY:-}" \
   "${MOONCAKE_BLOCK_SIZE}" \
   "${MOONCAKE_TOKEN_SEED}" \
-  "${VARIANT_MODE}" <<'PY'
+  "${VARIANT_MODE}" \
+  "${DIAGNOSTIC_RATE_VALUES[*]}" <<'PY'
 import json
 import sys
 from datetime import datetime, timezone
@@ -257,7 +292,7 @@ from pathlib import Path
 (path, model, served_model_name, dataset_path, workload_name, workload_slug,
  dataset_source_format, dataset_loader, request_rates, num_prompts,
  repetitions, max_concurrency, mooncake_block_size,
- mooncake_token_seed, variant_mode) = sys.argv[1:]
+ mooncake_token_seed, variant_mode, diagnostic_request_rates) = sys.argv[1:]
 manifest = {
     "created_at": datetime.now(timezone.utc).isoformat(),
     "workload": workload_name,
@@ -272,6 +307,7 @@ manifest = {
     ),
     "prefix_hash_ids_replayed": dataset_loader == "mooncake",
     "request_rates": request_rates.split(),
+    "diagnostic_request_rates": diagnostic_request_rates.split(),
     "load_values_semantics": (
         "recorded_arrival_rate_multiplier"
         if dataset_loader == "mooncake"
@@ -709,6 +745,9 @@ echo "Variant mode: ${VARIANT_MODE}"
 if [[ "${DATASET_LOADER}" == "mooncake" ]]; then
   echo "REQUEST_RATES are interpreted as recorded arrival-rate multipliers."
 fi
+if [[ "${RUN_DIAGNOSTIC_TRACE:-1}" == "1" ]]; then
+  echo "Diagnostic request rates: ${DIAGNOSTIC_RATE_VALUES[*]}"
+fi
 echo "Performance runs use vLLM defaults except required PD/topology arguments."
 
 if [[ "${NUM_PROMPTS}" == "0" ]]; then
@@ -745,19 +784,7 @@ else
 fi
 
 if [[ "${RUN_DIAGNOSTIC_TRACE:-1}" == "1" ]]; then
-  diagnostic_rate=${DIAGNOSTIC_REQUEST_RATE:-${REQUEST_RATE_VALUES[0]}}
   diagnostic_prompts=${DIAGNOSTIC_NUM_PROMPTS:-500}
-  if ! [[ "${diagnostic_rate}" == "inf" \
-      || "${diagnostic_rate}" =~ ^([0-9]+([.][0-9]*)?|[.][0-9]+)$ ]]; then
-    echo "Invalid DIAGNOSTIC_REQUEST_RATE: ${diagnostic_rate}" >&2
-    exit 1
-  fi
-  if [[ "${diagnostic_rate}" != "inf" ]] \
-      && ! python3 -c "import sys; sys.exit(0 if float(sys.argv[1]) > 0 else 1)" \
-        "${diagnostic_rate}"; then
-    echo "DIAGNOSTIC_REQUEST_RATE must be positive" >&2
-    exit 1
-  fi
   if ! [[ "${diagnostic_prompts}" =~ ^[1-9][0-9]*$ ]]; then
     echo "DIAGNOSTIC_NUM_PROMPTS must be a positive integer" >&2
     exit 1
@@ -767,10 +794,12 @@ if [[ "${RUN_DIAGNOSTIC_TRACE:-1}" == "1" ]]; then
   else
     diagnostic_variants=("${VARIANT_MODE}")
   fi
-  for variant in "${diagnostic_variants[@]}"; do
-    run_isolated_case \
-      "diagnostic" "${variant}" 1 "${diagnostic_rate}" \
-      "${diagnostic_prompts}" 1
+  for diagnostic_rate in "${DIAGNOSTIC_RATE_VALUES[@]}"; do
+    for variant in "${diagnostic_variants[@]}"; do
+      run_isolated_case \
+        "diagnostic" "${variant}" 1 "${diagnostic_rate}" \
+        "${diagnostic_prompts}" 1
+    done
   done
 fi
 

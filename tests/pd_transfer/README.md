@@ -257,6 +257,9 @@ single-variant run is not compatible with the OFF/ON comparison aggregator.
 Set `NUM_PROMPTS=0` together with `RUN_DIAGNOSTIC_TRACE=1` to skip the main
 trace-disabled performance cases and run only the trace-enabled diagnostic
 case.
+For a diagnostic arrival-rate sweep, set `DIAGNOSTIC_REQUEST_RATES` to a
+space-separated list such as `"0.5 1.0 2.0"`. It takes precedence over the
+backward-compatible single-value `DIAGNOSTIC_REQUEST_RATE` setting.
 
 The runner accepts `DATASET_LOADER=mooncake` in addition to the existing
 BurstGPT path. Existing configs using `BURSTGPT_DATASET_PATH` remain supported
@@ -274,9 +277,9 @@ After running the trace parser, `plot_pd_transfer.py` writes PNG figures plus
 - `02_kv_transfer_breakdown`: one pie per benchmark case, showing the
   mean-per-request connector time split across handshake, descriptor build,
   NIXL preparation/submission, observed completion, and other connector work
-- `03_kv_transfer_request_share`: one pie per benchmark case, showing the
-  mean KV load-to-connector-finish time as a share of mean end-to-end request
-  time (from proxy receipt until the Decode RPC ends)
+- `03_kv_transfer_ttft_share`: one pie per benchmark case, showing the mean
+  KV load-to-connector-finish time as a share of mean time to first token
+  (TTFT), so output-generation length does not affect the ratio
 - `04_request_e2e_scatter`: one raw scatter plot per benchmark case; every
   point is one request's end-to-end latency, ordered by proxy arrival time
 - `05_kv_transfer_scatter`: one raw scatter plot per benchmark case; every
