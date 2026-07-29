@@ -40,6 +40,15 @@ require_positive_integer() {
   fi
 }
 
+require_nonnegative_integer() {
+  local name=$1
+  local value=${!name:-}
+  if ! [[ "${value}" =~ ^[0-9]+$ ]]; then
+    echo "${name} must be a non-negative integer, got: ${value}" >&2
+    exit 1
+  fi
+}
+
 for required_name in \
   MODEL SERVED_MODEL_NAME PREFILL_DEVICES DECODE_DEVICES TP_SIZE HOST \
   PREFILL_PORT DECODE_PORT PROXY_PORT PREFILL_SIDE_CHANNEL_PORT \
@@ -52,9 +61,10 @@ done
 
 for integer_name in \
   TP_SIZE PREFILL_PORT DECODE_PORT PROXY_PORT PREFILL_SIDE_CHANNEL_PORT \
-  DECODE_SIDE_CHANNEL_PORT NUM_PROMPTS REPETITIONS; do
+  DECODE_SIDE_CHANNEL_PORT REPETITIONS; do
   require_positive_integer "${integer_name}"
 done
+require_nonnegative_integer NUM_PROMPTS
 
 if ! [[ "${WORKLOAD_SLUG}" =~ ^[A-Za-z0-9._-]+$ ]]; then
   echo "WORKLOAD_SLUG may contain only letters, numbers, dot, underscore, and dash" >&2
@@ -182,6 +192,11 @@ case "${VARIANT_MODE}" in
     exit 1
     ;;
 esac
+if [[ "${NUM_PROMPTS}" == "0" \
+    && "${RUN_DIAGNOSTIC_TRACE:-1}" != "1" ]]; then
+  echo "NUM_PROMPTS=0 skips performance runs and requires RUN_DIAGNOSTIC_TRACE=1" >&2
+  exit 1
+fi
 
 read -r -a REQUEST_RATE_VALUES <<< "${REQUEST_RATES}"
 if (( ${#REQUEST_RATE_VALUES[@]} == 0 )); then
@@ -696,34 +711,38 @@ if [[ "${DATASET_LOADER}" == "mooncake" ]]; then
 fi
 echo "Performance runs use vLLM defaults except required PD/topology arguments."
 
-for ((repetition = 1; repetition <= REPETITIONS; repetition++)); do
-  case "${VARIANT_MODE}" in
-    off|on)
-      ordered_variants=("${VARIANT_MODE}")
-      ordered_rates=("${REQUEST_RATE_VALUES[@]}")
-      ;;
-    paired)
-      if (( repetition % 2 == 1 )); then
-        ordered_variants=(off on)
+if [[ "${NUM_PROMPTS}" == "0" ]]; then
+  echo "Skipping trace-disabled performance runs because NUM_PROMPTS=0."
+else
+  for ((repetition = 1; repetition <= REPETITIONS; repetition++)); do
+    case "${VARIANT_MODE}" in
+      off|on)
+        ordered_variants=("${VARIANT_MODE}")
         ordered_rates=("${REQUEST_RATE_VALUES[@]}")
-      else
-        ordered_variants=(on off)
-        ordered_rates=()
-        for ((index = ${#REQUEST_RATE_VALUES[@]} - 1; index >= 0; index--)); do
-          ordered_rates+=("${REQUEST_RATE_VALUES[index]}")
-        done
-      fi
-      ;;
-  esac
+        ;;
+      paired)
+        if (( repetition % 2 == 1 )); then
+          ordered_variants=(off on)
+          ordered_rates=("${REQUEST_RATE_VALUES[@]}")
+        else
+          ordered_variants=(on off)
+          ordered_rates=()
+          for ((index = ${#REQUEST_RATE_VALUES[@]} - 1; index >= 0; index--)); do
+            ordered_rates+=("${REQUEST_RATE_VALUES[index]}")
+          done
+        fi
+        ;;
+    esac
 
-  for request_rate in "${ordered_rates[@]}"; do
-    for variant in "${ordered_variants[@]}"; do
-      run_isolated_case \
-        "performance" "${variant}" "${repetition}" "${request_rate}" \
-        "${NUM_PROMPTS}" 0
+    for request_rate in "${ordered_rates[@]}"; do
+      for variant in "${ordered_variants[@]}"; do
+        run_isolated_case \
+          "performance" "${variant}" "${repetition}" "${request_rate}" \
+          "${NUM_PROMPTS}" 0
+      done
     done
   done
-done
+fi
 
 if [[ "${RUN_DIAGNOSTIC_TRACE:-1}" == "1" ]]; then
   diagnostic_rate=${DIAGNOSTIC_REQUEST_RATE:-${REQUEST_RATE_VALUES[0]}}

@@ -235,6 +235,9 @@ repetitions run OFF then ON, while even repetitions reverse that order. Set
 `VARIANT_MODE=off` or `VARIANT_MODE=on` to run only one canonicalization
 variant, which is useful for smoke tests or workload characterization. A
 single-variant run is not compatible with the OFF/ON comparison aggregator.
+Set `NUM_PROMPTS=0` together with `RUN_DIAGNOSTIC_TRACE=1` to skip the main
+trace-disabled performance cases and run only the trace-enabled diagnostic
+case.
 
 The runner accepts `DATASET_LOADER=mooncake` in addition to the existing
 BurstGPT path. Existing configs using `BURSTGPT_DATASET_PATH` remain supported
