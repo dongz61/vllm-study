@@ -182,40 +182,50 @@ async def get_request(
     total_requests = len(input_requests)
     assert total_requests > 0, "No requests provided."
 
-    # Precompute delays among requests to minimize request send laggings
-    request_rates = []
-    delay_ts = []
-    for request_index, request in enumerate(input_requests):
-        current_request_rate = _get_current_request_rate(
-            ramp_up_strategy, ramp_up_start_rps, ramp_up_end_rps,
-            request_index, total_requests, request_rate)
-        request_rates.append(current_request_rate)
-        if current_request_rate == float("inf"):
-            delay_ts.append(0)
-        else:
-            theta = 1.0 / (current_request_rate * burstiness)
+    trace_offsets = [request.scheduled_offset_s for request in input_requests]
+    trace_replay = any(offset is not None for offset in trace_offsets)
+    if trace_replay:
+        if not all(offset is not None for offset in trace_offsets):
+            raise ValueError(
+                "A timestamped workload must schedule every request")
+        if ramp_up_strategy is not None:
+            raise ValueError(
+                "Traffic ramp-up cannot be combined with trace timestamps")
+        delay_ts = [float(offset) for offset in trace_offsets
+                    if offset is not None]
+        if delay_ts[0] != 0 or any(
+                current < previous
+                for previous, current in zip(delay_ts, delay_ts[1:])):
+            raise ValueError(
+                "Trace request offsets must start at zero and be "
+                "non-decreasing")
+        request_rates = [request_rate] * total_requests
+    else:
+        # Precompute delays among requests to minimize request send laggings.
+        request_rates = []
+        delay_ts = []
+        for request_index, request in enumerate(input_requests):
+            current_request_rate = _get_current_request_rate(
+                ramp_up_strategy, ramp_up_start_rps, ramp_up_end_rps,
+                request_index, total_requests, request_rate)
+            request_rates.append(current_request_rate)
+            if current_request_rate == float("inf"):
+                delay_ts.append(0)
+            else:
+                theta = 1.0 / (current_request_rate * burstiness)
 
-            # Sample the request interval from the gamma distribution.
-            # If burstiness is 1, it follows exponential distribution.
-            delay_ts.append(np.random.gamma(shape=burstiness, scale=theta))
+                # Sample the request interval from the gamma distribution.
+                # If burstiness is 1, it follows exponential distribution.
+                delay_ts.append(np.random.gamma(shape=burstiness, scale=theta))
 
-    # Calculate the cumulative delay time from the first sent out requests.
-    for i in range(1, len(delay_ts)):
-        delay_ts[i] += delay_ts[i - 1]
-    if ramp_up_strategy is None and delay_ts[-1] != 0:
-        # When ramp_up_strategy is not set, we assume the request rate is fixed
-        # and all requests should be sent in target_total_delay_s, the following
-        # logic would re-scale delay time to ensure the final delay_ts
-        # align with target_total_delay_s.
-        #
-        # NOTE: If we simply accumulate the random delta values
-        # from the gamma distribution, their sum would have 1-2% gap
-        # from target_total_delay_s. The purpose of the following logic is to
-        # close the gap for stabilizing the throughput data
-        # from different random seeds.
-        target_total_delay_s = total_requests / request_rate
-        normalize_factor = target_total_delay_s / delay_ts[-1]
-        delay_ts = [delay * normalize_factor for delay in delay_ts]
+        # Calculate cumulative delays from the first sent request.
+        for i in range(1, len(delay_ts)):
+            delay_ts[i] += delay_ts[i - 1]
+        if ramp_up_strategy is None and delay_ts[-1] != 0:
+            # Normalize sampled delays to the configured total duration.
+            target_total_delay_s = total_requests / request_rate
+            normalize_factor = target_total_delay_s / delay_ts[-1]
+            delay_ts = [delay * normalize_factor for delay in delay_ts]
 
     start_ts = time.time()
     for request_index, request in enumerate(input_requests):
@@ -528,7 +538,11 @@ async def benchmark(
         multi_modal_content=test_mm_content,
         ignore_eos=ignore_eos,
         extra_headers=extra_headers,
-        extra_body=extra_body,
+        extra_body=({
+            **(extra_body or {}),
+            "add_special_tokens": False,
+        } if (isinstance(test_prompt, list) and test_prompt
+              and isinstance(test_prompt[0], int)) else extra_body),
     )
 
     if ready_check_timeout_sec > 0:
@@ -571,10 +585,15 @@ async def benchmark(
         if profile_output.success:
             print("Profiler started")
 
-    distribution = ("Poisson process"
-                    if burstiness == 1.0 else "Gamma distribution")
+    trace_replay = all(
+        request.scheduled_offset_s is not None for request in input_requests)
+    distribution = ("trace timestamps" if trace_replay else
+                    ("Poisson process"
+                     if burstiness == 1.0 else "Gamma distribution"))
 
-    if ramp_up_strategy is not None:
+    if trace_replay:
+        print("Traffic arrival schedule: dataset trace timestamps")
+    elif ramp_up_strategy is not None:
         print(f"Traffic ramp-up strategy: {ramp_up_strategy}.")
         print(f"Will increase RPS from {ramp_up_start_rps} to "
               f"{ramp_up_end_rps} RPS over the duration of the benchmark.")
@@ -651,7 +670,11 @@ async def benchmark(
             multi_modal_content=mm_content,
             ignore_eos=ignore_eos,
             extra_headers=extra_headers,
-            extra_body=extra_body,
+            extra_body=({
+                **(extra_body or {}),
+                "add_special_tokens": False,
+            } if (isinstance(prompt, list) and prompt
+                  and isinstance(prompt[0], int)) else extra_body),
             request_id=request_id,
         )
         tasks.append(

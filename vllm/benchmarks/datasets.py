@@ -8,6 +8,7 @@ generation. Supported dataset types include:
   - Random (synthetic)
   - Sonnet
   - BurstGPT
+  - Mooncake
   - HuggingFace
   - VisionArena
 """
@@ -74,7 +75,7 @@ class SampleRequest:
     Represents a single inference request for benchmarking.
     """
 
-    prompt: Union[str, list[str]]
+    prompt: Union[str, list[str], list[int], list[list[int]]]
     prompt_len: int
     expected_output_len: int
     multi_modal_data: Optional[
@@ -82,6 +83,7 @@ class SampleRequest:
     ] = None
     lora_request: Optional[LoRARequest] = None
     request_id: Optional[str] = None
+    scheduled_offset_s: Optional[float] = None
 
 
 # -----------------------------------------------------------------------------
@@ -1042,8 +1044,8 @@ def add_dataset_parser(parser: FlexibleArgumentParser):
         default="random",
         action=_ValidateDatasetArgs,
         choices=[
-            "sharegpt", "burstgpt", "sonnet", "random", "random-mm", "hf",
-            "custom", "prefix_repetition", "spec_bench"
+            "sharegpt", "burstgpt", "mooncake", "sonnet", "random",
+            "random-mm", "hf", "custom", "prefix_repetition", "spec_bench"
         ],
         help="Name of the dataset to benchmark on.",
     )
@@ -1188,6 +1190,29 @@ def add_dataset_parser(parser: FlexibleArgumentParser):
         default=1,
         help=("Batch size for random sampling. "
               "Only used for embeddings benchmark."),
+    )
+
+    mooncake_group = parser.add_argument_group("Mooncake trace options")
+    mooncake_group.add_argument(
+        "--mooncake-block-size",
+        type=int,
+        default=512,
+        help="Number of prompt tokens represented by each Mooncake hash ID.",
+    )
+    mooncake_group.add_argument(
+        "--mooncake-arrival-rate-scale",
+        type=float,
+        default=1.0,
+        help=(
+            "Replay Mooncake timestamps at this multiple of the recorded "
+            "arrival rate. 2.0 halves all inter-arrival delays."
+        ),
+    )
+    mooncake_group.add_argument(
+        "--mooncake-token-seed",
+        type=int,
+        default=0,
+        help="Seed used to deterministically map hash IDs to token blocks.",
     )
 
     # random multimodal dataset options
@@ -1510,6 +1535,18 @@ def get_samples(args, tokenizer) -> list[SampleRequest]:
             ),
             "burstgpt": lambda: BurstGPTDataset(
                 random_seed=args.seed, dataset_path=args.dataset_path
+            ).sample(
+                tokenizer=tokenizer,
+                num_requests=args.num_prompts,
+                request_id_prefix=args.request_id_prefix,
+                no_oversample=args.no_oversample,
+            ),
+            "mooncake": lambda: MooncakeTraceDataset(
+                random_seed=args.seed,
+                dataset_path=args.dataset_path,
+                block_size=args.mooncake_block_size,
+                arrival_rate_scale=args.mooncake_arrival_rate_scale,
+                token_seed=args.mooncake_token_seed,
             ).sample(
                 tokenizer=tokenizer,
                 num_requests=args.num_prompts,
@@ -1885,6 +1922,223 @@ class BurstGPTDataset(BenchmarkDataset):
                     expected_output_len=output_len,
                     lora_request=lora_req,
                     request_id=request_id_prefix + str(i),
+                ))
+        return samples
+
+
+# -----------------------------------------------------------------------------
+# Mooncake Dataset Implementation
+# -----------------------------------------------------------------------------
+
+
+class MooncakeTraceDataset(BenchmarkDataset):
+    """Replay Mooncake FAST'25 prefix sharing, order, and timestamps.
+
+    The public traces contain anonymized prefix block hash IDs rather than raw
+    tokens. Each hash ID is deterministically expanded to a synthetic token
+    block, so repeated hash IDs produce byte-for-byte identical prompt tokens.
+    """
+
+    _MASK64 = (1 << 64) - 1
+    _LCG_MULTIPLIER = 6364136223846793005
+    _LCG_INCREMENT = 1442695040888963407
+
+    def __init__(
+        self,
+        *,
+        block_size: int = 512,
+        arrival_rate_scale: float = 1.0,
+        token_seed: int = 0,
+        **kwargs,
+    ) -> None:
+        if block_size <= 0:
+            raise ValueError("Mooncake block size must be positive")
+        if not math.isfinite(arrival_rate_scale) or arrival_rate_scale <= 0:
+            raise ValueError("Mooncake arrival-rate scale must be positive")
+        self.block_size = block_size
+        self.arrival_rate_scale = arrival_rate_scale
+        self.token_seed = token_seed & self._MASK64
+        super().__init__(**kwargs)
+        self.load_data()
+
+    @staticmethod
+    def _positive_integer(value: Any, field: str, line_number: int) -> int:
+        if isinstance(value, bool):
+            raise ValueError(
+                f"line {line_number}: {field} must be a positive integer")
+        try:
+            converted = int(value)
+        except (TypeError, ValueError) as error:
+            raise ValueError(
+                f"line {line_number}: {field} must be a positive integer"
+            ) from error
+        if converted != value or converted <= 0:
+            raise ValueError(
+                f"line {line_number}: {field} must be a positive integer")
+        return converted
+
+    def load_data(self) -> None:
+        if self.dataset_path is None:
+            raise ValueError("dataset_path must be provided for Mooncake")
+
+        records: list[tuple[float, int, int, list[int]]] = []
+        previous_timestamp: Optional[float] = None
+        with open(self.dataset_path, encoding="utf-8-sig") as trace_file:
+            for line_number, raw_line in enumerate(trace_file, start=1):
+                if not raw_line.strip():
+                    continue
+                try:
+                    record = json.loads(raw_line)
+                except json.JSONDecodeError as error:
+                    raise ValueError(
+                        f"line {line_number}: invalid Mooncake JSON"
+                    ) from error
+                if not isinstance(record, dict):
+                    raise ValueError(
+                        f"line {line_number}: expected a JSON object")
+
+                timestamp_value = record.get("timestamp")
+                if isinstance(timestamp_value, bool):
+                    raise ValueError(
+                        f"line {line_number}: timestamp must be numeric")
+                try:
+                    timestamp = float(timestamp_value)
+                except (TypeError, ValueError) as error:
+                    raise ValueError(
+                        f"line {line_number}: timestamp must be numeric"
+                    ) from error
+                if not math.isfinite(timestamp) or timestamp < 0:
+                    raise ValueError(
+                        f"line {line_number}: timestamp must be non-negative")
+                if (previous_timestamp is not None
+                        and timestamp < previous_timestamp):
+                    raise ValueError(
+                        f"line {line_number}: timestamps must be "
+                        "non-decreasing")
+                previous_timestamp = timestamp
+
+                input_length = self._positive_integer(
+                    record.get("input_length"), "input_length", line_number)
+                output_length = self._positive_integer(
+                    record.get("output_length"), "output_length", line_number)
+                raw_hash_ids = record.get("hash_ids")
+                if not isinstance(raw_hash_ids, list) or not raw_hash_ids:
+                    raise ValueError(
+                        f"line {line_number}: hash_ids must be a non-empty list")
+                hash_ids: list[int] = []
+                for hash_id in raw_hash_ids:
+                    if isinstance(hash_id, bool):
+                        raise ValueError(
+                            f"line {line_number}: hash IDs must be integers")
+                    try:
+                        converted_hash_id = int(hash_id)
+                    except (TypeError, ValueError) as error:
+                        raise ValueError(
+                            f"line {line_number}: hash IDs must be integers"
+                        ) from error
+                    if converted_hash_id != hash_id or converted_hash_id < 0:
+                        raise ValueError(
+                            f"line {line_number}: hash IDs must be "
+                            "non-negative integers")
+                    hash_ids.append(converted_hash_id)
+
+                expected_blocks = math.ceil(input_length / self.block_size)
+                if len(hash_ids) != expected_blocks:
+                    raise ValueError(
+                        f"line {line_number}: input_length={input_length} "
+                        f"requires {expected_blocks} hash IDs at block size "
+                        f"{self.block_size}, got {len(hash_ids)}")
+                records.append(
+                    (timestamp, input_length, output_length, hash_ids))
+
+        if not records:
+            raise ValueError("Mooncake trace contains no requests")
+        self.data = records
+
+    @staticmethod
+    def _valid_token_ids(
+        tokenizer: PreTrainedTokenizerBase,
+    ) -> tuple[int, ...]:
+        vocab_size = getattr(tokenizer, "vocab_size", None)
+        if not isinstance(vocab_size, int) or vocab_size <= 0:
+            vocab_size = len(tokenizer)
+        special_ids = {
+            int(token_id)
+            for token_id in getattr(tokenizer, "all_special_ids", ())
+            if isinstance(token_id, int)
+        }
+        valid_ids = tuple(
+            token_id for token_id in range(vocab_size)
+            if token_id not in special_ids
+        )
+        if not valid_ids:
+            raise ValueError("Tokenizer has no non-special token IDs")
+        return valid_ids
+
+    def _make_block(
+        self,
+        hash_id: int,
+        valid_token_ids: tuple[int, ...],
+    ) -> list[int]:
+        state = (
+            hash_id + self.token_seed + 0x9E3779B97F4A7C15
+        ) & self._MASK64
+        block: list[int] = []
+        for _ in range(self.block_size):
+            state = (
+                state * self._LCG_MULTIPLIER + self._LCG_INCREMENT
+            ) & self._MASK64
+            block.append(valid_token_ids[state % len(valid_token_ids)])
+        return block
+
+    def sample(
+        self,
+        tokenizer: PreTrainedTokenizerBase,
+        num_requests: int,
+        request_id_prefix: str = "",
+        no_oversample: bool = False,
+        **kwargs,
+    ) -> list[SampleRequest]:
+        del no_oversample, kwargs
+        if num_requests <= 0:
+            raise ValueError("num_requests must be positive")
+        if num_requests > len(self.data):
+            raise ValueError(
+                "Mooncake trace replay does not oversample because doing so "
+                "would break request order and timestamps")
+
+        selected = self.data[:num_requests]
+        first_timestamp = selected[0][0]
+        valid_token_ids = self._valid_token_ids(tokenizer)
+        block_cache: dict[int, list[int]] = {}
+        samples: list[SampleRequest] = []
+        for index, (
+            timestamp,
+            input_length,
+            output_length,
+            hash_ids,
+        ) in enumerate(selected):
+            prompt_token_ids: list[int] = []
+            for hash_id in hash_ids:
+                block = block_cache.get(hash_id)
+                if block is None:
+                    block = self._make_block(hash_id, valid_token_ids)
+                    block_cache[hash_id] = block
+                prompt_token_ids.extend(block)
+            del prompt_token_ids[input_length:]
+            assert len(prompt_token_ids) == input_length
+
+            samples.append(
+                SampleRequest(
+                    prompt=prompt_token_ids,
+                    prompt_len=input_length,
+                    expected_output_len=output_length,
+                    request_id=request_id_prefix + str(index),
+                    scheduled_offset_s=(
+                        (timestamp - first_timestamp)
+                        / 1000.0
+                        / self.arrival_rate_scale
+                    ),
                 ))
         return samples
 

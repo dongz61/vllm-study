@@ -177,39 +177,38 @@ window, excluding health checks and Random warm-up requests.
 
 ## Mooncake long-input performance
 
-Use the same isolated OFF/ON runner with a Mooncake FAST'25 length trace to
-measure the optimization when long inputs turn over the KV block pool many
-times. Download one of the official JSONL traces locally. The synthetic trace
-has the longest average input and is the recommended first mechanism test:
+Use the same isolated OFF/ON runner with a Mooncake FAST'25 trace. The native
+loader preserves request order and timestamps and maps every prefix `hash_id`
+to a deterministic 512-token block. Repeated hash IDs therefore produce
+identical prompt tokens and exercise vLLM prefix caching. Download one of the
+official JSONL traces locally:
 
 ```bash
-wget -O dataset/synthetic_trace.jsonl \
-  https://raw.githubusercontent.com/kvcache-ai/Mooncake/main/FAST25-release/traces/synthetic_trace.jsonl
+for name in conversation toolagent synthetic; do
+  wget -O "dataset/${name}_trace.jsonl" \
+    "https://raw.githubusercontent.com/kvcache-ai/Mooncake/main/FAST25-release/traces/${name}_trace.jsonl"
+done
 ```
 
-Convert it with the standard-library-only adapter:
+Prepare each trace with the same context limit. For example:
 
 ```bash
 python tests/pd_transfer/prepare_mooncake_trace.py \
   dataset/synthetic_trace.jsonl \
-  dataset/mooncake_synthetic_vllm.csv \
+  dataset/mooncake_synthetic_filtered.jsonl \
   --max-total-tokens 40960
 ```
 
-The converter writes the positional CSV consumed by the vLLM 0.11 BurstGPT
-loader and a neighboring `mooncake_synthetic_vllm.stats.json` file. It rejects
-malformed rows, filters requests whose input plus output exceeds the configured
-context limit, and prints input/output/total length statistics. Pass `--force`
-to replace an existing conversion.
+JSONL output preserves timestamps, lengths, order, and `hash_ids`; the
+neighboring statistics file records the context-limit filtering. The adapter
+rejects malformed rows, non-monotonic timestamps, and invalid hashes. Pass
+`--force` to replace an existing conversion. CSV output remains available only
+for historical length-only experiments and cannot reproduce prefix sharing.
+Use conversation as the primary real workload, toolagent as the high-reuse
+real workload, and synthetic as the public long-context stress workload. Set
+`DATASET_PATH`, `WORKLOAD_NAME`, and `WORKLOAD_SLUG` separately for each run.
 
-Only timestamps and input/output lengths are preserved. Mooncake `hash_ids`
-are intentionally not replayed, so the benchmark uses synthetic request-unique
-contents rather than reproducing prefix-cache sharing. The runner also uses its
-configured request rate instead of replaying the original timestamps. This
-keeps OFF/ON request lengths identical while isolating long-input block
-turnover.
-
-Copy both the converted CSV and the repository changes to the server, then
+Copy both the filtered JSONL and the repository changes to the server, then
 prepare the separate configuration:
 
 ```bash
@@ -223,16 +222,17 @@ python tests/pd_transfer/compare_pd_generalization_perf.py \
   results/pd_transfer_long_context/<run-id>
 ```
 
-The example's `0.1 0.2 0.4` request rates are calibration starting points, not
-portable final rates. Run a small smoke test on the target model/GPU before the
-three-repetition experiment. The long-input result is valid only when the
-diagnostic ON case reports substantial `canonicalized_block_fraction`; compare
-that fraction with the end-to-end and transfer-path improvement rather than
-assuming prompt length alone guarantees paired-reverse allocation.
+For the Mooncake loader, `REQUEST_RATES` are recorded arrival-rate multipliers:
+`1.0` replays native timestamps, `0.5` runs at half the recorded rate, and
+`2.0` doubles it. The example's `0.1 0.2 0.4` values are only calibration
+starting points. Prefix caching is explicitly enabled on both servers, output
+lengths are enforced with `--ignore-eos`, and the benchmark's duplicate
+first-prompt readiness request is disabled because the runner already checks
+P, D, and proxy health independently.
 
-The runner now accepts the generic `DATASET_PATH`, `WORKLOAD_NAME`,
-`WORKLOAD_SLUG`, and `DATASET_SOURCE_FORMAT` settings. Existing configs using
-`BURSTGPT_DATASET_PATH` remain supported as a compatibility fallback.
+The runner accepts `DATASET_LOADER=mooncake` in addition to the existing
+BurstGPT path. Existing configs using `BURSTGPT_DATASET_PATH` remain supported
+as a compatibility fallback.
 
 This v0.11 branch has NIXL pull support only; push-mode comparison is not part
 of this harness.

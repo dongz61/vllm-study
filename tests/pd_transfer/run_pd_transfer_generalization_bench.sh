@@ -13,9 +13,12 @@ source "${CONFIG_PATH}"
 # DATASET_PATH supersedes the original BurstGPT-specific name. Keep the
 # fallback so existing local configs continue to work unchanged.
 DATASET_PATH=${DATASET_PATH:-${BURSTGPT_DATASET_PATH:-}}
+DATASET_LOADER=${DATASET_LOADER:-burstgpt}
 WORKLOAD_NAME=${WORKLOAD_NAME:-burstgpt-v1.1}
 WORKLOAD_SLUG=${WORKLOAD_SLUG:-burstgpt}
 DATASET_SOURCE_FORMAT=${DATASET_SOURCE_FORMAT:-burstgpt-v1.1-csv}
+MOONCAKE_BLOCK_SIZE=${MOONCAKE_BLOCK_SIZE:-512}
+MOONCAKE_TOKEN_SEED=${MOONCAKE_TOKEN_SEED:-0}
 
 require_value() {
   local name=$1
@@ -38,7 +41,8 @@ for required_name in \
   MODEL SERVED_MODEL_NAME PREFILL_DEVICES DECODE_DEVICES TP_SIZE HOST \
   PREFILL_PORT DECODE_PORT PROXY_PORT PREFILL_SIDE_CHANNEL_PORT \
   DECODE_SIDE_CHANNEL_PORT PREFILL_ENGINE_ID DECODE_ENGINE_ID \
-  DATASET_PATH WORKLOAD_NAME WORKLOAD_SLUG DATASET_SOURCE_FORMAT \
+  DATASET_PATH DATASET_LOADER WORKLOAD_NAME WORKLOAD_SLUG \
+  DATASET_SOURCE_FORMAT \
   REQUEST_RATES NUM_PROMPTS REPETITIONS RESULT_ROOT; do
   require_value "${required_name}"
 done
@@ -59,13 +63,70 @@ if [[ ! -f "${DATASET_PATH}" ]]; then
   exit 1
 fi
 
+if [[ "${DATASET_LOADER}" != "burstgpt" \
+    && "${DATASET_LOADER}" != "mooncake" ]]; then
+  echo "DATASET_LOADER must be burstgpt or mooncake" >&2
+  exit 1
+fi
+if [[ "${DATASET_LOADER}" == "mooncake" ]]; then
+  require_positive_integer MOONCAKE_BLOCK_SIZE
+fi
+
 validate_compatible_dataset() {
-  python3 - "${DATASET_PATH}" <<'PY'
+  python3 - "${DATASET_PATH}" "${DATASET_LOADER}" \
+    "${MOONCAKE_BLOCK_SIZE}" "${NUM_PROMPTS}" <<'PY'
 import csv
+import json
+import math
 import sys
 from pathlib import Path
 
 path = Path(sys.argv[1])
+loader = sys.argv[2]
+block_size = int(sys.argv[3])
+num_prompts = int(sys.argv[4])
+
+if loader == "mooncake":
+    count = 0
+    previous_timestamp = None
+    with path.open("r", encoding="utf-8-sig") as file:
+        for line_number, line in enumerate(file, 1):
+            if not line.strip():
+                continue
+            count += 1
+            record = json.loads(line)
+            timestamp = float(record["timestamp"])
+            input_length = int(record["input_length"])
+            output_length = int(record["output_length"])
+            hash_ids = record["hash_ids"]
+            if timestamp < 0 or (
+                previous_timestamp is not None
+                and timestamp < previous_timestamp
+            ):
+                raise SystemExit(
+                    f"line {line_number}: timestamps must be non-decreasing"
+                )
+            if input_length <= 0 or output_length <= 0:
+                raise SystemExit(
+                    f"line {line_number}: lengths must be positive"
+                )
+            expected = math.ceil(input_length / block_size)
+            if not isinstance(hash_ids, list) or len(hash_ids) != expected:
+                raise SystemExit(
+                    f"line {line_number}: expected {expected} hash IDs, "
+                    f"got {len(hash_ids) if isinstance(hash_ids, list) else 0}"
+                )
+            previous_timestamp = timestamp
+    if count < num_prompts:
+        raise SystemExit(
+            f"Mooncake trace has {count} requests, fewer than {num_prompts}"
+        )
+    print(
+        f"Validated Mooncake JSONL: {path} "
+        f"({count} requests, block_size={block_size})"
+    )
+    raise SystemExit(0)
+
 with path.open("r", newline="", encoding="utf-8-sig") as file:
     reader = csv.reader(file)
     try:
@@ -83,7 +144,7 @@ problems = [
 if problems:
     raise SystemExit(
         "CSV is incompatible with the vLLM 0.11 positional BurstGPT loader. "
-        "Use BurstGPT v1.1 or the Mooncake conversion script.\n"
+        "Use BurstGPT v1.1 for this loader.\n"
         + "\n".join(problems)
     )
 
@@ -130,6 +191,11 @@ for request_rate in "${REQUEST_RATE_VALUES[@]}"; do
     echo "Request rate must be positive: ${request_rate}" >&2
     exit 1
   fi
+  if [[ "${DATASET_LOADER}" == "mooncake" \
+      && "${request_rate}" == "inf" ]]; then
+    echo "Mooncake arrival-rate scale must be finite" >&2
+    exit 1
+  fi
   if [[ -n "${SEEN_REQUEST_RATES[${request_rate}]:-}" ]]; then
     echo "Duplicate request rate: ${request_rate}" >&2
     exit 1
@@ -149,18 +215,22 @@ python3 - \
   "${WORKLOAD_NAME}" \
   "${WORKLOAD_SLUG}" \
   "${DATASET_SOURCE_FORMAT}" \
+  "${DATASET_LOADER}" \
   "${REQUEST_RATES}" \
   "${NUM_PROMPTS}" \
   "${REPETITIONS}" \
-  "${MAX_CONCURRENCY:-}" <<'PY'
+  "${MAX_CONCURRENCY:-}" \
+  "${MOONCAKE_BLOCK_SIZE}" \
+  "${MOONCAKE_TOKEN_SEED}" <<'PY'
 import json
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
 (path, model, served_model_name, dataset_path, workload_name, workload_slug,
- dataset_source_format, request_rates, num_prompts, repetitions,
- max_concurrency) = sys.argv[1:]
+ dataset_source_format, dataset_loader, request_rates, num_prompts,
+ repetitions, max_concurrency, mooncake_block_size,
+ mooncake_token_seed) = sys.argv[1:]
 manifest = {
     "created_at": datetime.now(timezone.utc).isoformat(),
     "workload": workload_name,
@@ -169,8 +239,23 @@ manifest = {
     "served_model_name": served_model_name,
     "dataset_path": dataset_path,
     "dataset_source_format": dataset_source_format,
-    "vllm_dataset_loader": "burstgpt",
+    "vllm_dataset_loader": dataset_loader,
+    "arrival_mode": (
+        "trace_timestamps" if dataset_loader == "mooncake" else "generated"
+    ),
+    "prefix_hash_ids_replayed": dataset_loader == "mooncake",
     "request_rates": request_rates.split(),
+    "load_values_semantics": (
+        "recorded_arrival_rate_multiplier"
+        if dataset_loader == "mooncake"
+        else "requests_per_second"
+    ),
+    "mooncake_block_size": (
+        int(mooncake_block_size) if dataset_loader == "mooncake" else None
+    ),
+    "mooncake_token_seed": (
+        int(mooncake_token_seed) if dataset_loader == "mooncake" else None
+    ),
     "num_prompts": int(num_prompts),
     "repetitions": int(repetitions),
     "max_concurrency": (
@@ -461,6 +546,7 @@ run_warmup() {
     --ignore-eos \
     --seed "${warmup_seed}" \
     --temperature 0 \
+    --ready-check-timeout-sec 0 \
     --request-id-prefix "warmup-${case_id}-" \
     ${WARMUP_EXTRA_ARGS:-} 2>&1 | tee "${case_dir}/warmup.log"
 }
@@ -476,6 +562,9 @@ run_formal_benchmark() {
   local -a detailed_args=()
   local -a concurrency_args=()
   local -a ignore_eos_args=()
+  local -a dataset_args=()
+  local -a traffic_args=()
+  local arrival_mode
 
   if [[ "${SAVE_DETAILED:-1}" == "1" ]]; then
     detailed_args+=(--save-detailed)
@@ -485,6 +574,21 @@ run_formal_benchmark() {
   fi
   if [[ "${IGNORE_EOS:-1}" == "1" ]]; then
     ignore_eos_args+=(--ignore-eos)
+  fi
+  if [[ "${DATASET_LOADER}" == "mooncake" ]]; then
+    arrival_mode="trace_timestamps"
+    dataset_args+=(
+      --dataset-name mooncake
+      --dataset-path "${DATASET_PATH}"
+      --mooncake-block-size "${MOONCAKE_BLOCK_SIZE}"
+      --mooncake-arrival-rate-scale "${request_rate}"
+      --mooncake-token-seed "${MOONCAKE_TOKEN_SEED}"
+    )
+    traffic_args+=(--request-rate inf)
+  else
+    arrival_mode="generated"
+    dataset_args+=(--dataset-name burstgpt --dataset-path "${DATASET_PATH}")
+    traffic_args+=(--request-rate "${request_rate}")
   fi
 
   echo "Benchmark: phase=${phase}, variant=${variant}, repetition=${repetition}, request_rate=${request_rate}, prompts=${num_prompts}"
@@ -496,11 +600,11 @@ run_formal_benchmark() {
     --tokenizer "${BENCH_TOKENIZER:-${MODEL}}" \
     --host "${HOST}" \
     --port "${PROXY_PORT}" \
-    --dataset-name burstgpt \
-    --dataset-path "${DATASET_PATH}" \
+    "${dataset_args[@]}" \
     --num-prompts "${num_prompts}" \
-    --request-rate "${request_rate}" \
+    "${traffic_args[@]}" \
     "${concurrency_args[@]}" \
+    --ready-check-timeout-sec 0 \
     --save-result \
     "${detailed_args[@]}" \
     --result-dir "${case_dir}" \
@@ -510,6 +614,8 @@ run_formal_benchmark() {
       "variant=${variant}" \
       "repetition=${repetition}" \
       "configured_request_rate=${request_rate}" \
+      "dataset_loader=${DATASET_LOADER}" \
+      "arrival_mode=${arrival_mode}" \
       "workload=${WORKLOAD_NAME}" \
     "${ignore_eos_args[@]}" \
     --seed "${BENCH_SEED:-1024}" \
@@ -566,7 +672,11 @@ run_isolated_case() {
 
 echo "Results will be saved to ${RUN_ROOT}"
 echo "Workload: ${WORKLOAD_NAME}, mixed input/output lengths"
+echo "Dataset loader: ${DATASET_LOADER}"
 echo "Dataset source format: ${DATASET_SOURCE_FORMAT}"
+if [[ "${DATASET_LOADER}" == "mooncake" ]]; then
+  echo "REQUEST_RATES are interpreted as recorded arrival-rate multipliers."
+fi
 echo "Performance runs use vLLM defaults except required PD/topology arguments."
 
 for ((repetition = 1; repetition <= REPETITIONS; repetition++)); do
