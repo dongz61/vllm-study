@@ -180,6 +180,7 @@ def _target_worker(
     """Own the remote buffer and keep the target NIXL agent alive."""
     agent = None
     reg_descs = None
+    remote_name = None
     try:
         import torch
 
@@ -214,6 +215,22 @@ def _target_worker(
                 message = connection.recv()
                 if message == "stop":
                     break
+                if (
+                    isinstance(message, dict)
+                    and message.get("type") == "add_remote"
+                ):
+                    remote_name = agent.add_remote_agent(message["metadata"])
+                    if _agent_name_text(remote_name) != "initiator":
+                        raise RuntimeError(
+                            "target loaded unexpected remote agent name: "
+                            f"{remote_name!r}"
+                        )
+                    connection.send(
+                        {
+                            "type": "remote_added",
+                            "remote_name": _agent_name_text(remote_name),
+                        }
+                    )
             else:
                 # This also gives configurations without an effective UCX
                 # progress thread a chance to advance control traffic.
@@ -226,6 +243,11 @@ def _target_worker(
         except BaseException:
             pass
     finally:
+        if agent is not None and remote_name is not None:
+            try:
+                agent.remove_remote_agent(remote_name)
+            except BaseException:
+                pass
         if agent is not None and reg_descs is not None:
             try:
                 agent.deregister_memory(reg_descs, backends=["UCX"])
@@ -311,7 +333,10 @@ def _run_one(
                 raise RuntimeError("NIXL check_xfer_state() returned ERR")
             if time.perf_counter() >= deadline:
                 raise TimeoutError(
-                    f"transfer did not finish within {timeout_seconds}s"
+                    f"{order}/{('on' if mitigation else 'off')} transfer "
+                    f"did not finish within {timeout_seconds}s "
+                    f"(initial_state={initial_state}, last_state={state}, "
+                    f"poll_count={poll_count})"
                 )
         done_ns = time.perf_counter_ns()
     finally:
@@ -575,6 +600,28 @@ def main() -> int:
         if _agent_name_text(remote_name) != "target":
             raise RuntimeError(
                 f"loaded unexpected remote agent name: {remote_name!r}"
+            )
+        # Current NIXL two-peer examples establish metadata in both directions.
+        # NIXL 0.6.0 allowed this one-sided READ benchmark to work with only
+        # target metadata loaded at the initiator, but using a symmetric
+        # exchange avoids relying on that version-specific behavior.
+        parent_connection.send(
+            {"type": "add_remote", "metadata": agent.get_agent_metadata()}
+        )
+        if not parent_connection.poll(args.timeout_seconds):
+            raise TimeoutError("target did not acknowledge initiator metadata")
+        remote_ack = parent_connection.recv()
+        if remote_ack.get("type") == "error":
+            raise RuntimeError(
+                "target metadata import failed:\n"
+                + remote_ack.get("traceback", "unknown error")
+            )
+        if (
+            remote_ack.get("type") != "remote_added"
+            or remote_ack.get("remote_name") != "initiator"
+        ):
+            raise RuntimeError(
+                f"unexpected target metadata acknowledgement: {remote_ack!r}"
             )
 
         local_views = _make_views(
