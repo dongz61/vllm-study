@@ -131,6 +131,13 @@ def _sequence_direction(values: list[int]) -> str:
     return "mixed"
 
 
+def _agent_name_text(agent_name: str | bytes) -> str:
+    """Normalize binding return values without changing API-facing values."""
+    if isinstance(agent_name, bytes):
+        return agent_name.decode("utf-8")
+    return agent_name
+
+
 def _make_views(buffer, descriptor_count: int, descriptor_bytes: int):
     return [
         buffer.narrow(0, index * descriptor_bytes, descriptor_bytes)
@@ -565,7 +572,7 @@ def main() -> int:
         agent = _make_agent("initiator")
         reg_descs = agent.register_memory(local_buffer, backends=["UCX"])
         remote_name = agent.add_remote_agent(target_message["metadata"])
-        if remote_name != "target":
+        if _agent_name_text(remote_name) != "target":
             raise RuntimeError(
                 f"loaded unexpected remote agent name: {remote_name!r}"
             )
