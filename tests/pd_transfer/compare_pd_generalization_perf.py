@@ -332,7 +332,7 @@ def _summarize_diagnostic_traces(root: Path) -> list[dict[str, Any]]:
                 local_blocks, canonicalized_blocks)
             if local > 0
         ]
-        summaries.append({
+        summary = {
             "variant": variant,
             "profile_count": len(profiles),
             "transferred_request_count": sum(
@@ -363,7 +363,73 @@ def _summarize_diagnostic_traces(root: Path) -> list[dict[str, Any]]:
             "p99_request_canonicalized_block_fraction":
                 _nearest_rank_float(
                     per_request_canonicalized_fractions, 0.99),
-        })
+        }
+        reorder_fields = (
+            "forward_only_range_count",
+            "reverse_canonicalized_range_count",
+            "reordered_optimal_range_count",
+            "additional_reorderable_edge_count",
+            "generalized_reordered_block_count",
+        )
+        if all(all(field in profile for field in reorder_fields)
+               for profile in profiles):
+            forward_ranges = [
+                int(profile["forward_only_range_count"])
+                for profile in profiles
+            ]
+            reverse_ranges = [
+                int(profile["reverse_canonicalized_range_count"])
+                for profile in profiles
+            ]
+            reordered_ranges = [
+                int(profile["reordered_optimal_range_count"])
+                for profile in profiles
+            ]
+            additional_edges = [
+                int(profile["additional_reorderable_edge_count"])
+                for profile in profiles
+            ]
+            moved_blocks = [
+                int(profile["generalized_reordered_block_count"])
+                for profile in profiles
+            ]
+            per_request_additional_fractions = [
+                additional / reverse
+                for additional, reverse in zip(additional_edges,
+                                               reverse_ranges)
+                if reverse > 0
+            ]
+            total_reverse_ranges = sum(reverse_ranges)
+            opportunity_request_count = sum(
+                additional > 0 for additional in additional_edges)
+            summary.update({
+                "reorder_opportunity_request_count":
+                    opportunity_request_count,
+                "reorder_opportunity_request_fraction":
+                    opportunity_request_count / len(profiles),
+                "total_forward_only_range_count": sum(forward_ranges),
+                "total_reverse_canonicalized_range_count":
+                    total_reverse_ranges,
+                "total_reordered_optimal_range_count":
+                    sum(reordered_ranges),
+                "total_additional_reorderable_edge_count":
+                    sum(additional_edges),
+                "additional_reorderable_range_fraction": (
+                    sum(additional_edges) / total_reverse_ranges
+                    if total_reverse_ranges else 0.0),
+                "total_generalized_reordered_block_count":
+                    sum(moved_blocks),
+                "p50_request_additional_reorderable_range_fraction":
+                    _nearest_rank_float(
+                        per_request_additional_fractions, 0.50),
+                "p90_request_additional_reorderable_range_fraction":
+                    _nearest_rank_float(
+                        per_request_additional_fractions, 0.90),
+                "p99_request_additional_reorderable_range_fraction":
+                    _nearest_rank_float(
+                        per_request_additional_fractions, 0.99),
+            })
+        summaries.append(summary)
     return summaries
 
 

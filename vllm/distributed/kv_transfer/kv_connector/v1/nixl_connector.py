@@ -111,6 +111,10 @@ class _BlockPairStats:
     forward_only_range_count: int
     reverse_only_range_count: int
     theoretical_merged_range_count: int
+    reverse_canonicalized_range_count: int
+    reordered_optimal_range_count: int
+    additional_reorderable_edge_count: int
+    generalized_reordered_block_count: int
     longest_paired_forward_run: int
     longest_paired_reverse_run: int
     local_first_block_id: Optional[int]
@@ -145,6 +149,10 @@ def _analyze_block_pairs(local_block_ids: list[int],
             forward_only_range_count=0,
             reverse_only_range_count=0,
             theoretical_merged_range_count=0,
+            reverse_canonicalized_range_count=0,
+            reordered_optimal_range_count=0,
+            additional_reorderable_edge_count=0,
+            generalized_reordered_block_count=0,
             longest_paired_forward_run=0,
             longest_paired_reverse_run=0,
             local_first_block_id=None,
@@ -190,6 +198,30 @@ def _analyze_block_pairs(local_block_ids: list[int],
     forward_lengths = [length for direction, length in runs if direction == 1]
     reverse_lengths = [length for direction, length in runs if direction == -1]
 
+    # Measure the exact forward range count after applying the existing reverse
+    # canonicalization. This can be smaller than ``len(runs)`` when reversing a
+    # run also makes it contiguous with one or both neighboring runs.
+    reverse_local, reverse_remote, _, _ = _canonicalize_paired_reverse_runs(
+        local_block_ids, remote_block_ids)
+    reverse_canonicalized_range_count = _count_forward_ranges(
+        reverse_local, reverse_remote)
+
+    # A pair-preserving reorder may move copy operations freely while keeping
+    # every local destination mapped to the same remote source. With unique
+    # local block IDs, sorting by local ID exposes every possible successor
+    # pair ``(local + 1, remote + 1)``, so this is the minimum forward range
+    # count attainable by reordering the submitted block pairs.
+    reorder = sorted(range(num_blocks), key=local_block_ids.__getitem__)
+    reordered_local = [local_block_ids[index] for index in reorder]
+    reordered_remote = [remote_block_ids[index] for index in reorder]
+    reordered_optimal_range_count = _count_forward_ranges(
+        reordered_local, reordered_remote)
+    generalized_reordered_block_count = sum(
+        original_index != submitted_index
+        for submitted_index, original_index in enumerate(reorder))
+    additional_reorderable_edge_count = max(
+        0, reverse_canonicalized_range_count - reordered_optimal_range_count)
+
     return _BlockPairStats(
         paired_forward_run_count=len(forward_lengths),
         paired_reverse_run_count=len(reverse_lengths),
@@ -197,6 +229,10 @@ def _analyze_block_pairs(local_block_ids: list[int],
         forward_only_range_count=forward_only_range_count,
         reverse_only_range_count=reverse_only_range_count,
         theoretical_merged_range_count=len(runs),
+        reverse_canonicalized_range_count=(reverse_canonicalized_range_count),
+        reordered_optimal_range_count=reordered_optimal_range_count,
+        additional_reorderable_edge_count=(additional_reorderable_edge_count),
+        generalized_reordered_block_count=(generalized_reordered_block_count),
         longest_paired_forward_run=max(forward_lengths, default=0),
         longest_paired_reverse_run=max(reverse_lengths, default=0),
         local_first_block_id=local_block_ids[0],
@@ -208,6 +244,19 @@ def _analyze_block_pairs(local_block_ids: list[int],
         remote_min_block_id=min(remote_block_ids),
         remote_max_block_id=max(remote_block_ids),
     )
+
+
+def _count_forward_ranges(local_block_ids: list[int],
+                          remote_block_ids: list[int]) -> int:
+    """Count ranges mergeable by a forward-only descriptor backend."""
+    if len(local_block_ids) != len(remote_block_ids):
+        raise ValueError("local and remote block ID counts must match")
+    if not local_block_ids:
+        return 0
+    return 1 + sum(
+        local_block_ids[index + 1] != local_block_ids[index] +
+        1 or remote_block_ids[index + 1] != remote_block_ids[index] + 1
+        for index in range(len(local_block_ids) - 1))
 
 
 def _canonicalize_paired_reverse_runs(
@@ -296,6 +345,10 @@ class _NixlTransferTraceState:
     forward_only_range_count: int = 0
     reverse_only_range_count: int = 0
     theoretical_merged_range_count: int = 0
+    reverse_canonicalized_range_count: int = 0
+    reordered_optimal_range_count: int = 0
+    additional_reorderable_edge_count: int = 0
+    generalized_reordered_block_count: int = 0
     longest_paired_forward_run: int = 0
     longest_paired_reverse_run: int = 0
     local_first_block_id: Optional[int] = None
@@ -1442,6 +1495,14 @@ class NixlConnectorWorker:
                 block_pair_stats.reverse_only_range_count)
             state.theoretical_merged_range_count += (
                 block_pair_stats.theoretical_merged_range_count)
+            state.reverse_canonicalized_range_count += (
+                block_pair_stats.reverse_canonicalized_range_count)
+            state.reordered_optimal_range_count += (
+                block_pair_stats.reordered_optimal_range_count)
+            state.additional_reorderable_edge_count += (
+                block_pair_stats.additional_reorderable_edge_count)
+            state.generalized_reordered_block_count += (
+                block_pair_stats.generalized_reordered_block_count)
             state.longest_paired_forward_run = max(
                 state.longest_paired_forward_run,
                 block_pair_stats.longest_paired_forward_run)
@@ -1560,6 +1621,14 @@ class NixlConnectorWorker:
             reverse_only_range_count=state.reverse_only_range_count,
             theoretical_merged_range_count=(
                 state.theoretical_merged_range_count),
+            reverse_canonicalized_range_count=(
+                state.reverse_canonicalized_range_count),
+            reordered_optimal_range_count=(
+                state.reordered_optimal_range_count),
+            additional_reorderable_edge_count=(
+                state.additional_reorderable_edge_count),
+            generalized_reordered_block_count=(
+                state.generalized_reordered_block_count),
             longest_paired_forward_run=state.longest_paired_forward_run,
             longest_paired_reverse_run=state.longest_paired_reverse_run,
             local_first_block_id=state.local_first_block_id,

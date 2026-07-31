@@ -1016,6 +1016,34 @@ def test_analyze_block_pairs_rejects_mismatched_counts():
 
 
 @pytest.mark.parametrize(
+    "local_blocks,remote_blocks,expected",
+    [
+        ([], [], (0, 0, 0, 0)),
+        ([1, 2, 3], [11, 12, 13], (1, 1, 0, 0)),
+        ([3, 2, 1], [13, 12, 11], (1, 1, 0, 2)),
+        # The existing reverse transform fixes this permutation completely by
+        # reversing its middle [3, 2] run.
+        ([1, 3, 2, 4], [11, 13, 12, 14], (1, 1, 0, 2)),
+        # No paired -1 run exists, but sorting the preserved pairs by local ID
+        # exposes one fully contiguous range.
+        ([1, 3, 5, 2, 4], [11, 13, 15, 12, 14], (5, 1, 4, 4)),
+        # Independent local/remote layouts remain fragmented after sorting.
+        ([1, 3, 5, 2, 4], [21, 11, 40, 18, 30], (5, 5, 0, 4)),
+    ],
+)
+def test_analyze_block_pairs_reports_generalized_reorder_opportunity(
+        local_blocks, remote_blocks, expected):
+    stats = _analyze_block_pairs(local_blocks, remote_blocks)
+
+    assert (
+        stats.reverse_canonicalized_range_count,
+        stats.reordered_optimal_range_count,
+        stats.additional_reorderable_edge_count,
+        stats.generalized_reordered_block_count,
+    ) == expected
+
+
+@pytest.mark.parametrize(
     "local_blocks,remote_blocks,expected_local,expected_remote,"
     "expected_runs,expected_blocks",
     [
@@ -1162,6 +1190,10 @@ def test_record_transfer_shape_accumulates_block_pair_stats():
     assert state.forward_only_range_count == 3
     assert state.reverse_only_range_count == 4
     assert state.theoretical_merged_range_count == 2
+    assert state.reverse_canonicalized_range_count == 2
+    assert state.reordered_optimal_range_count == 2
+    assert state.additional_reorderable_edge_count == 0
+    assert state.generalized_reordered_block_count == 2
     assert state.longest_paired_forward_run == 3
     assert state.longest_paired_reverse_run == 2
     assert state.local_first_block_id == 1
@@ -1214,6 +1246,10 @@ def test_pd_transfer_profile_is_emitted_once():
             forward_only_range_count=4,
             reverse_only_range_count=5,
             theoretical_merged_range_count=6,
+            reverse_canonicalized_range_count=4,
+            reordered_optimal_range_count=3,
+            additional_reorderable_edge_count=1,
+            generalized_reordered_block_count=9,
             longest_paired_forward_run=7,
             longest_paired_reverse_run=8,
             local_first_block_id=10,
@@ -1252,6 +1288,10 @@ def test_pd_transfer_profile_is_emitted_once():
     assert fields["forward_only_range_count"] == 4
     assert fields["reverse_only_range_count"] == 5
     assert fields["theoretical_merged_range_count"] == 6
+    assert fields["reverse_canonicalized_range_count"] == 4
+    assert fields["reordered_optimal_range_count"] == 3
+    assert fields["additional_reorderable_edge_count"] == 1
+    assert fields["generalized_reordered_block_count"] == 9
     assert fields["longest_paired_forward_run"] == 7
     assert fields["longest_paired_reverse_run"] == 8
     assert fields["local_first_block_id"] == 10

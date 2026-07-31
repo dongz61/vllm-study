@@ -173,6 +173,11 @@ def test_diagnostic_summary_reports_reverse_and_block_fractions(tmp_path):
             "paired_forward_run_count": 0,
             "paired_reverse_run_count": 1,
             "canonicalized_reverse_block_count": 100,
+            "forward_only_range_count": 100,
+            "reverse_canonicalized_range_count": 10,
+            "reordered_optimal_range_count": 5,
+            "additional_reorderable_edge_count": 5,
+            "generalized_reordered_block_count": 90,
         },
         {
             "event": "pull_transfer_profile",
@@ -182,6 +187,11 @@ def test_diagnostic_summary_reports_reverse_and_block_fractions(tmp_path):
             "num_remote_blocks": 10,
             "paired_forward_run_count": 0,
             "paired_reverse_run_count": 1,
+            "forward_only_range_count": 10,
+            "reverse_canonicalized_range_count": 4,
+            "reordered_optimal_range_count": 2,
+            "additional_reorderable_edge_count": 2,
+            "generalized_reordered_block_count": 8,
         },
         {
             "event": "pull_transfer_profile",
@@ -191,6 +201,11 @@ def test_diagnostic_summary_reports_reverse_and_block_fractions(tmp_path):
             "num_remote_blocks": 6,
             "paired_forward_run_count": 1,
             "paired_reverse_run_count": 0,
+            "forward_only_range_count": 3,
+            "reverse_canonicalized_range_count": 3,
+            "reordered_optimal_range_count": 3,
+            "additional_reorderable_edge_count": 0,
+            "generalized_reordered_block_count": 0,
         },
     ]
     _write_diagnostic_trace(
@@ -232,6 +247,16 @@ def test_diagnostic_summary_reports_reverse_and_block_fractions(tmp_path):
     assert on["total_local_block_count"] == 16
     assert on["canonicalized_block_count"] == 8
     assert on["canonicalized_block_fraction"] == pytest.approx(0.5)
+    assert on["reorder_opportunity_request_count"] == 1
+    assert on["reorder_opportunity_request_fraction"] == pytest.approx(0.5)
+    assert on["total_forward_only_range_count"] == 13
+    assert on["total_reverse_canonicalized_range_count"] == 7
+    assert on["total_reordered_optimal_range_count"] == 5
+    assert on["total_additional_reorderable_edge_count"] == 2
+    assert on["additional_reorderable_range_fraction"] == pytest.approx(2 / 7)
+    assert on[
+        "p90_request_additional_reorderable_range_fraction"
+    ] == pytest.approx(0.5)
     assert on[
         "p50_request_canonicalized_block_fraction"
     ] == pytest.approx(0.0)

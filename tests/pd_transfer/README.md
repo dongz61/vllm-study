@@ -51,6 +51,25 @@ Each run writes the resolved value to `experiment_config.json`. Decoder
 `canonicalized_reverse_run_count`, and
 `canonicalized_reverse_block_count`.
 
+When detailed PD tracing is enabled, the connector also estimates the remaining
+pair-preserving reorder opportunity without changing the submitted descriptors:
+
+- `reverse_canonicalized_range_count` is the exact forward-only range count
+  after applying the existing paired-reverse transform in analysis only;
+- `reordered_optimal_range_count` is the forward-only range count after stably
+  sorting corresponding local/remote pairs by local block ID;
+- `additional_reorderable_edge_count` is the extra range reduction available
+  beyond paired-reverse canonicalization;
+- `generalized_reordered_block_count` is the number of pair positions changed
+  by that stable sort.
+
+These fields are collected whether canonicalization is OFF or ON. Therefore a
+trace-enabled `VARIANT_MODE=off` diagnostic run is sufficient to characterize
+both the reverse-only and generalized-reorder opportunities without applying
+either optimization to the submitted transfer. The diagnostic analysis itself
+sorts the block-pair metadata and emits JSONL records, so use a separate
+trace-disabled OFF run for headline latency, TTFT, and throughput numbers.
+
 `xfer_done_observed_perf_ns` is the time vLLM first observed NIXL return DONE;
 it is not a hardware-level physical-completion timestamp. Compare an isolated
 NIXL benchmark with the integrated profile before attributing this whole span
@@ -172,8 +191,10 @@ input/output length sequences, and pairing. It writes
 diagnostic traces exist, `diagnostic_trace_summary.csv`. The diagnostic
 summary includes reverse-request fraction, total local/remote blocks,
 canonicalized-block fraction, and p50/p90/p99 per-request canonicalized-block
-fractions. Diagnostic profiles are restricted to the formal benchmark time
-window, excluding health checks and Random warm-up requests.
+fractions. New traces also report the request coverage and total/p50/p90/p99
+range reduction available from generalized pair reordering beyond the existing
+reverse transform. Diagnostic profiles are restricted to the formal benchmark
+time window, excluding health checks and Random warm-up requests.
 
 ## Mooncake long-input performance
 

@@ -36,6 +36,10 @@ def test_transfer_profile_is_merged_into_request_timeline(tmp_path):
             "forward_only_range_count": 3,
             "reverse_only_range_count": 5,
             "theoretical_merged_range_count": 4,
+            "reverse_canonicalized_range_count": 3,
+            "reordered_optimal_range_count": 2,
+            "additional_reorderable_edge_count": 1,
+            "generalized_reordered_block_count": 12,
             "block_pair_stats_ms": 0.125,
             "reverse_block_pair_canonicalization_enabled": True,
             "canonicalized_reverse_run_count": 2,
@@ -96,6 +100,10 @@ def test_transfer_profile_is_merged_into_request_timeline(tmp_path):
     assert row["forward_only_range_count"] == 3
     assert row["reverse_only_range_count"] == 5
     assert row["theoretical_merged_range_count"] == 4
+    assert row["reverse_canonicalized_range_count"] == 3
+    assert row["reordered_optimal_range_count"] == 2
+    assert row["additional_reorderable_edge_count"] == 1
+    assert row["generalized_reordered_block_count"] == 12
     assert row["block_pair_stats_ms"] == 0.125
     assert row["reverse_block_pair_canonicalization_enabled"] is True
     assert row["canonicalized_reverse_run_count"] == 2
