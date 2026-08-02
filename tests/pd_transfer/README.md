@@ -275,6 +275,15 @@ repetitions run OFF then ON, while even repetitions reverse that order. Set
 `VARIANT_MODE=off` or `VARIANT_MODE=on` to run only one canonicalization
 variant, which is useful for smoke tests or workload characterization. A
 single-variant run is not compatible with the OFF/ON comparison aggregator.
+Set `TRANSFER_DELAY_MS_LIST` to a space-separated list such as
+`"0 50 100 200"` to run a transfer-latency sensitivity sweep. The runner
+restarts isolated P/D processes for every delay, injects the delay only on the
+Decode side after NIXL completion, and records it in the case ID, result path,
+trace events, and benchmark metadata. Multi-delay sweeps require
+`VARIANT_MODE=off` or `VARIANT_MODE=on` so the OFF/ON aggregator cannot mix
+different delays. Even repetitions reverse the delay order. Use
+`DIAGNOSTIC_TRANSFER_DELAY_MS_LIST`, for example `"0 200"`, to trace only
+selected validation points; it defaults to the first performance delay.
 Set `NUM_PROMPTS=0` together with `RUN_DIAGNOSTIC_TRACE=1` to skip the main
 trace-disabled performance cases and run only the trace-enabled diagnostic
 case.

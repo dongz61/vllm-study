@@ -22,6 +22,10 @@ MOONCAKE_TOKEN_SEED=${MOONCAKE_TOKEN_SEED:-0}
 # paired runs OFF and ON in alternating order across repetitions.  Single
 # variant modes are useful for smoke tests and workload characterization.
 VARIANT_MODE=${VARIANT_MODE:-paired}
+# Extra non-blocking delay after NIXL receive completion and before the Decode
+# worker reports the remote KV as ready. Keep the default at zero so existing
+# OFF/ON generalization runs retain their original behavior.
+TRANSFER_DELAY_MS_LIST=${TRANSFER_DELAY_MS_LIST:-0}
 
 require_value() {
   local name=$1
@@ -192,6 +196,69 @@ case "${VARIANT_MODE}" in
     exit 1
     ;;
 esac
+
+read -r -a TRANSFER_DELAY_VALUES <<< "${TRANSFER_DELAY_MS_LIST}"
+if (( ${#TRANSFER_DELAY_VALUES[@]} == 0 )); then
+  echo "TRANSFER_DELAY_MS_LIST must contain at least one value" >&2
+  exit 1
+fi
+python3 - "TRANSFER_DELAY_MS_LIST" "${TRANSFER_DELAY_VALUES[@]}" <<'PY'
+import math
+import sys
+
+name, *raw_values = sys.argv[1:]
+seen = set()
+for raw_value in raw_values:
+    try:
+        value = float(raw_value)
+    except ValueError as error:
+        raise SystemExit(f"Invalid transfer delay in {name}: {raw_value}") from error
+    if not math.isfinite(value) or value < 0:
+        raise SystemExit(
+            f"Transfer delay must be finite and non-negative: {raw_value}"
+        )
+    if value in seen:
+        raise SystemExit(f"Duplicate transfer delay in {name}: {raw_value}")
+    seen.add(value)
+PY
+
+DIAGNOSTIC_TRANSFER_DELAY_VALUES=()
+if [[ "${RUN_DIAGNOSTIC_TRACE:-1}" == "1" ]]; then
+  diagnostic_transfer_delays=${DIAGNOSTIC_TRANSFER_DELAY_MS_LIST:-${TRANSFER_DELAY_VALUES[0]}}
+  read -r -a DIAGNOSTIC_TRANSFER_DELAY_VALUES <<< "${diagnostic_transfer_delays}"
+  if (( ${#DIAGNOSTIC_TRANSFER_DELAY_VALUES[@]} == 0 )); then
+    echo "DIAGNOSTIC_TRANSFER_DELAY_MS_LIST must contain at least one value" >&2
+    exit 1
+  fi
+  python3 - "DIAGNOSTIC_TRANSFER_DELAY_MS_LIST" \
+    "${DIAGNOSTIC_TRANSFER_DELAY_VALUES[@]}" <<'PY'
+import math
+import sys
+
+name, *raw_values = sys.argv[1:]
+seen = set()
+for raw_value in raw_values:
+    try:
+        value = float(raw_value)
+    except ValueError as error:
+        raise SystemExit(f"Invalid transfer delay in {name}: {raw_value}") from error
+    if not math.isfinite(value) or value < 0:
+        raise SystemExit(
+            f"Transfer delay must be finite and non-negative: {raw_value}"
+        )
+    if value in seen:
+        raise SystemExit(f"Duplicate transfer delay in {name}: {raw_value}")
+    seen.add(value)
+PY
+fi
+
+if [[ "${VARIANT_MODE}" == "paired" ]] \
+    && (( ${#TRANSFER_DELAY_VALUES[@]} > 1 \
+          || ${#DIAGNOSTIC_TRANSFER_DELAY_VALUES[@]} > 1 )); then
+  echo "Transfer-delay sweeps require VARIANT_MODE=off or VARIANT_MODE=on" >&2
+  echo "The OFF/ON aggregator does not pair results across multiple delays" >&2
+  exit 1
+fi
 if [[ "${NUM_PROMPTS}" == "0" \
     && "${RUN_DIAGNOSTIC_TRACE:-1}" != "1" ]]; then
   echo "NUM_PROMPTS=0 skips performance runs and requires RUN_DIAGNOSTIC_TRACE=1" >&2
@@ -283,7 +350,9 @@ python3 - \
   "${MOONCAKE_BLOCK_SIZE}" \
   "${MOONCAKE_TOKEN_SEED}" \
   "${VARIANT_MODE}" \
-  "${DIAGNOSTIC_RATE_VALUES[*]}" <<'PY'
+  "${DIAGNOSTIC_RATE_VALUES[*]}" \
+  "${TRANSFER_DELAY_VALUES[*]}" \
+  "${DIAGNOSTIC_TRANSFER_DELAY_VALUES[*]}" <<'PY'
 import json
 import sys
 from datetime import datetime, timezone
@@ -292,7 +361,8 @@ from pathlib import Path
 (path, model, served_model_name, dataset_path, workload_name, workload_slug,
  dataset_source_format, dataset_loader, request_rates, num_prompts,
  repetitions, max_concurrency, mooncake_block_size,
- mooncake_token_seed, variant_mode, diagnostic_request_rates) = sys.argv[1:]
+ mooncake_token_seed, variant_mode, diagnostic_request_rates,
+ transfer_delay_ms, diagnostic_transfer_delay_ms) = sys.argv[1:]
 manifest = {
     "created_at": datetime.now(timezone.utc).isoformat(),
     "workload": workload_name,
@@ -308,6 +378,10 @@ manifest = {
     "prefix_hash_ids_replayed": dataset_loader == "mooncake",
     "request_rates": request_rates.split(),
     "diagnostic_request_rates": diagnostic_request_rates.split(),
+    "transfer_delay_ms": [float(value) for value in transfer_delay_ms.split()],
+    "diagnostic_transfer_delay_ms": [
+        float(value) for value in diagnostic_transfer_delay_ms.split()
+    ],
     "load_values_semantics": (
         "recorded_arrival_rate_multiplier"
         if dataset_loader == "mooncake"
@@ -495,11 +569,13 @@ start_vllm_server() {
   local case_dir=$6
   local variant=$7
   local trace_enabled=$8
+  local transfer_delay_ms=$9
   local kv_role role_extra_args kv_json log_file
 
   if [[ "${role}" == "prefill" ]]; then
     kv_role="kv_producer"
     role_extra_args="${PREFILL_EXTRA_ARGS:-}"
+    transfer_delay_ms=0
   else
     kv_role="kv_consumer"
     role_extra_args="${DECODE_EXTRA_ARGS:-}"
@@ -507,13 +583,13 @@ start_vllm_server() {
   kv_json=$(kv_config "${kv_role}" "${engine_id}" "${variant}")
   log_file="${case_dir}/${role}.log"
 
-  echo "Starting ${variant}/${role} on port ${port}, log=${log_file}"
+  echo "Starting ${variant}/${role} with transfer_delay_ms=${transfer_delay_ms} on port ${port}, log=${log_file}"
   (
     export CUDA_VISIBLE_DEVICES="${devices}"
     export UCX_NET_DEVICES="${UCX_NET_DEVICES:-all}"
     export VLLM_NIXL_SIDE_CHANNEL_HOST="${HOST}"
     export VLLM_NIXL_SIDE_CHANNEL_PORT="${side_channel_port}"
-    export VLLM_PD_TRANSFER_SLEEP_MS=0
+    export VLLM_PD_TRANSFER_SLEEP_MS="${transfer_delay_ms}"
     if [[ "${trace_enabled}" == "1" ]]; then
       export VLLM_PD_TRACE_PATH="${case_dir}/${role}.trace.jsonl"
       export VLLM_PD_TRACE_ROLE="${role}"
@@ -566,6 +642,10 @@ rate_slug() {
   printf '%s' "$1" | tr '.' 'p'
 }
 
+delay_slug() {
+  printf '%s' "$1" | tr '.' 'p'
+}
+
 write_case_event() {
   local case_dir=$1
   local event=$2
@@ -575,11 +655,12 @@ write_case_event() {
   local repetition=$6
   local request_rate=$7
   local num_prompts=$8
+  local transfer_delay_ms=$9
   local ts_ns
   ts_ns=$(date +%s%N)
-  printf '{"ts_ns":%s,"role":"bench","event":"%s","case_id":"%s","mode":"pull","dataset":"%s","phase":"%s","variant":"%s","repetition":%s,"request_rate":"%s","num_prompts":%s}\n' \
+  printf '{"ts_ns":%s,"role":"bench","event":"%s","case_id":"%s","mode":"pull","dataset":"%s","phase":"%s","variant":"%s","repetition":%s,"request_rate":"%s","num_prompts":%s,"injected_transfer_delay_ms":%s}\n' \
     "${ts_ns}" "${event}" "${case_id}" "${WORKLOAD_SLUG}" "${phase}" "${variant}" \
-    "${repetition}" "${request_rate}" "${num_prompts}" \
+    "${repetition}" "${request_rate}" "${num_prompts}" "${transfer_delay_ms}" \
     >> "${case_dir}/case.trace.jsonl"
 }
 
@@ -626,6 +707,7 @@ run_formal_benchmark() {
   local repetition=$5
   local request_rate=$6
   local num_prompts=$7
+  local transfer_delay_ms=$8
   local -a detailed_args=()
   local -a concurrency_args=()
   local -a ignore_eos_args=()
@@ -658,9 +740,10 @@ run_formal_benchmark() {
     traffic_args+=(--request-rate "${request_rate}")
   fi
 
-  echo "Benchmark: phase=${phase}, variant=${variant}, repetition=${repetition}, request_rate=${request_rate}, prompts=${num_prompts}"
+  echo "Benchmark: phase=${phase}, variant=${variant}, repetition=${repetition}, request_rate=${request_rate}, transfer_delay_ms=${transfer_delay_ms}, prompts=${num_prompts}"
   write_case_event "${case_dir}" "bench_case_start" "${case_id}" "${phase}" \
-    "${variant}" "${repetition}" "${request_rate}" "${num_prompts}"
+    "${variant}" "${repetition}" "${request_rate}" "${num_prompts}" \
+    "${transfer_delay_ms}"
   vllm bench serve \
     --backend vllm \
     --model "${SERVED_MODEL_NAME}" \
@@ -681,6 +764,7 @@ run_formal_benchmark() {
       "variant=${variant}" \
       "repetition=${repetition}" \
       "configured_request_rate=${request_rate}" \
+      "injected_transfer_delay_ms=${transfer_delay_ms}" \
       "dataset_loader=${DATASET_LOADER}" \
       "arrival_mode=${arrival_mode}" \
       "workload=${WORKLOAD_NAME}" \
@@ -692,7 +776,8 @@ run_formal_benchmark() {
     --request-id-prefix "${case_id}-" \
     ${BENCH_EXTRA_ARGS:-} 2>&1 | tee "${case_dir}/benchmark.log"
   write_case_event "${case_dir}" "bench_case_end" "${case_id}" "${phase}" \
-    "${variant}" "${repetition}" "${request_rate}" "${num_prompts}"
+    "${variant}" "${repetition}" "${request_rate}" "${num_prompts}" \
+    "${transfer_delay_ms}"
 }
 
 run_isolated_case() {
@@ -702,11 +787,13 @@ run_isolated_case() {
   local request_rate=$4
   local num_prompts=$5
   local trace_enabled=$6
-  local slug case_id case_dir warmup_seed
+  local transfer_delay_ms=$7
+  local slug transfer_delay_slug case_id case_dir warmup_seed
 
   slug=$(rate_slug "${request_rate}")
-  case_id="${WORKLOAD_SLUG}-${phase}-rps-${slug}-rep-${repetition}-${variant}"
-  case_dir="${RUN_ROOT}/${phase}/${variant}/rps-${slug}/rep-${repetition}"
+  transfer_delay_slug=$(delay_slug "${transfer_delay_ms}")
+  case_id="${WORKLOAD_SLUG}-${phase}-rps-${slug}-delay-${transfer_delay_slug}-rep-${repetition}-${variant}"
+  case_dir="${RUN_ROOT}/${phase}/${variant}/rps-${slug}/delay-${transfer_delay_slug}/rep-${repetition}"
   mkdir -p "${case_dir}"
 
   # Every isolated server receives the same warm-up workload. The Random
@@ -717,11 +804,11 @@ run_isolated_case() {
   start_vllm_server \
     "prefill" "${PREFILL_PORT}" "${PREFILL_SIDE_CHANNEL_PORT}" \
     "${PREFILL_ENGINE_ID}" "${PREFILL_DEVICES}" "${case_dir}" \
-    "${variant}" "${trace_enabled}"
+    "${variant}" "${trace_enabled}" "${transfer_delay_ms}"
   start_vllm_server \
     "decode" "${DECODE_PORT}" "${DECODE_SIDE_CHANNEL_PORT}" \
     "${DECODE_ENGINE_ID}" "${DECODE_DEVICES}" "${case_dir}" \
-    "${variant}" "${trace_enabled}"
+    "${variant}" "${trace_enabled}" "${transfer_delay_ms}"
   wait_for_server "${PREFILL_PORT}" "${variant}/prefill"
   wait_for_server "${DECODE_PORT}" "${variant}/decode"
 
@@ -730,7 +817,7 @@ run_isolated_case() {
   run_warmup "${case_dir}" "${case_id}" "${warmup_seed}"
   run_formal_benchmark \
     "${case_dir}" "${case_id}" "${phase}" "${variant}" "${repetition}" \
-    "${request_rate}" "${num_prompts}"
+    "${request_rate}" "${num_prompts}" "${transfer_delay_ms}"
 
   cleanup
   PIDS=()
@@ -742,11 +829,13 @@ echo "Workload: ${WORKLOAD_NAME}, mixed input/output lengths"
 echo "Dataset loader: ${DATASET_LOADER}"
 echo "Dataset source format: ${DATASET_SOURCE_FORMAT}"
 echo "Variant mode: ${VARIANT_MODE}"
+echo "Transfer delays (ms): ${TRANSFER_DELAY_VALUES[*]}"
 if [[ "${DATASET_LOADER}" == "mooncake" ]]; then
   echo "REQUEST_RATES are interpreted as recorded arrival-rate multipliers."
 fi
 if [[ "${RUN_DIAGNOSTIC_TRACE:-1}" == "1" ]]; then
   echo "Diagnostic request rates: ${DIAGNOSTIC_RATE_VALUES[*]}"
+  echo "Diagnostic transfer delays (ms): ${DIAGNOSTIC_TRANSFER_DELAY_VALUES[*]}"
 fi
 echo "Performance runs use vLLM defaults except required PD/topology arguments."
 
@@ -754,6 +843,14 @@ if [[ "${NUM_PROMPTS}" == "0" ]]; then
   echo "Skipping trace-disabled performance runs because NUM_PROMPTS=0."
 else
   for ((repetition = 1; repetition <= REPETITIONS; repetition++)); do
+    ordered_transfer_delays=()
+    if (( repetition % 2 == 1 )); then
+      ordered_transfer_delays=("${TRANSFER_DELAY_VALUES[@]}")
+    else
+      for ((index = ${#TRANSFER_DELAY_VALUES[@]} - 1; index >= 0; index--)); do
+        ordered_transfer_delays+=("${TRANSFER_DELAY_VALUES[index]}")
+      done
+    fi
     case "${VARIANT_MODE}" in
       off|on)
         ordered_variants=("${VARIANT_MODE}")
@@ -775,9 +872,11 @@ else
 
     for request_rate in "${ordered_rates[@]}"; do
       for variant in "${ordered_variants[@]}"; do
-        run_isolated_case \
-          "performance" "${variant}" "${repetition}" "${request_rate}" \
-          "${NUM_PROMPTS}" 0
+        for transfer_delay_ms in "${ordered_transfer_delays[@]}"; do
+          run_isolated_case \
+            "performance" "${variant}" "${repetition}" "${request_rate}" \
+            "${NUM_PROMPTS}" 0 "${transfer_delay_ms}"
+        done
       done
     done
   done
@@ -796,9 +895,11 @@ if [[ "${RUN_DIAGNOSTIC_TRACE:-1}" == "1" ]]; then
   fi
   for diagnostic_rate in "${DIAGNOSTIC_RATE_VALUES[@]}"; do
     for variant in "${diagnostic_variants[@]}"; do
-      run_isolated_case \
-        "diagnostic" "${variant}" 1 "${diagnostic_rate}" \
-        "${diagnostic_prompts}" 1
+      for transfer_delay_ms in "${DIAGNOSTIC_TRANSFER_DELAY_VALUES[@]}"; do
+        run_isolated_case \
+          "diagnostic" "${variant}" 1 "${diagnostic_rate}" \
+          "${diagnostic_prompts}" 1 "${transfer_delay_ms}"
+      done
     done
   done
 fi
