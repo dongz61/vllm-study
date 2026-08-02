@@ -286,7 +286,11 @@ different delays. Even repetitions reverse the delay order. Use
 selected validation points; it defaults to the first performance delay.
 Set `NUM_PROMPTS=0` together with `RUN_DIAGNOSTIC_TRACE=1` to skip the main
 trace-disabled performance cases and run only the trace-enabled diagnostic
-case.
+cases. Diagnostic cases repeat `REPETITIONS` times by default. Set
+`DIAGNOSTIC_REPETITIONS` to use an independent repeat count; every repetition
+starts fresh P/D processes and writes to its own `rep-N` directory. Odd
+diagnostic repetitions use the configured rate, variant, and delay order,
+while even repetitions reverse all three orders to reduce ordering bias.
 For a diagnostic arrival-rate sweep, set `DIAGNOSTIC_REQUEST_RATES` to a
 space-separated list such as `"0.5 1.0 2.0"`. It takes precedence over the
 backward-compatible single-value `DIAGNOSTIC_REQUEST_RATE` setting.

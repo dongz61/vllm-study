@@ -188,6 +188,14 @@ if [[ "${RUN_DIAGNOSTIC_TRACE:-1}" != "0" \
   echo "RUN_DIAGNOSTIC_TRACE must be 0 or 1" >&2
   exit 1
 fi
+DIAGNOSTIC_REPETITION_COUNT=0
+if [[ "${RUN_DIAGNOSTIC_TRACE:-1}" == "1" ]]; then
+  # Preserve the existing REPETITIONS setting as the default while allowing
+  # trace-enabled cases to be repeated independently from performance cases.
+  DIAGNOSTIC_REPETITIONS=${DIAGNOSTIC_REPETITIONS:-${REPETITIONS}}
+  require_positive_integer DIAGNOSTIC_REPETITIONS
+  DIAGNOSTIC_REPETITION_COUNT=${DIAGNOSTIC_REPETITIONS}
+fi
 case "${VARIANT_MODE}" in
   off|on|paired)
     ;;
@@ -346,6 +354,7 @@ python3 - \
   "${REQUEST_RATES}" \
   "${NUM_PROMPTS}" \
   "${REPETITIONS}" \
+  "${DIAGNOSTIC_REPETITION_COUNT}" \
   "${MAX_CONCURRENCY:-}" \
   "${MOONCAKE_BLOCK_SIZE}" \
   "${MOONCAKE_TOKEN_SEED}" \
@@ -360,7 +369,7 @@ from pathlib import Path
 
 (path, model, served_model_name, dataset_path, workload_name, workload_slug,
  dataset_source_format, dataset_loader, request_rates, num_prompts,
- repetitions, max_concurrency, mooncake_block_size,
+ repetitions, diagnostic_repetitions, max_concurrency, mooncake_block_size,
  mooncake_token_seed, variant_mode, diagnostic_request_rates,
  transfer_delay_ms, diagnostic_transfer_delay_ms) = sys.argv[1:]
 manifest = {
@@ -395,6 +404,7 @@ manifest = {
     ),
     "num_prompts": int(num_prompts),
     "repetitions": int(repetitions),
+    "diagnostic_repetitions": int(diagnostic_repetitions),
     "max_concurrency": (
         int(max_concurrency) if max_concurrency else None
     ),
@@ -836,6 +846,7 @@ fi
 if [[ "${RUN_DIAGNOSTIC_TRACE:-1}" == "1" ]]; then
   echo "Diagnostic request rates: ${DIAGNOSTIC_RATE_VALUES[*]}"
   echo "Diagnostic transfer delays (ms): ${DIAGNOSTIC_TRANSFER_DELAY_VALUES[*]}"
+  echo "Diagnostic repetitions: ${DIAGNOSTIC_REPETITION_COUNT}"
 fi
 echo "Performance runs use vLLM defaults except required PD/topology arguments."
 
@@ -888,17 +899,46 @@ if [[ "${RUN_DIAGNOSTIC_TRACE:-1}" == "1" ]]; then
     echo "DIAGNOSTIC_NUM_PROMPTS must be a positive integer" >&2
     exit 1
   fi
-  if [[ "${VARIANT_MODE}" == "paired" ]]; then
-    diagnostic_variants=(off on)
-  else
-    diagnostic_variants=("${VARIANT_MODE}")
-  fi
-  for diagnostic_rate in "${DIAGNOSTIC_RATE_VALUES[@]}"; do
-    for variant in "${diagnostic_variants[@]}"; do
-      for transfer_delay_ms in "${DIAGNOSTIC_TRANSFER_DELAY_VALUES[@]}"; do
-        run_isolated_case \
-          "diagnostic" "${variant}" 1 "${diagnostic_rate}" \
-          "${diagnostic_prompts}" 1 "${transfer_delay_ms}"
+  for ((diagnostic_repetition = 1;
+        diagnostic_repetition <= DIAGNOSTIC_REPETITION_COUNT;
+        diagnostic_repetition++)); do
+    ordered_diagnostic_rates=()
+    ordered_diagnostic_transfer_delays=()
+    if (( diagnostic_repetition % 2 == 1 )); then
+      ordered_diagnostic_rates=("${DIAGNOSTIC_RATE_VALUES[@]}")
+      ordered_diagnostic_transfer_delays=(
+        "${DIAGNOSTIC_TRANSFER_DELAY_VALUES[@]}")
+      if [[ "${VARIANT_MODE}" == "paired" ]]; then
+        ordered_diagnostic_variants=(off on)
+      else
+        ordered_diagnostic_variants=("${VARIANT_MODE}")
+      fi
+    else
+      for ((index = ${#DIAGNOSTIC_RATE_VALUES[@]} - 1;
+            index >= 0; index--)); do
+        ordered_diagnostic_rates+=("${DIAGNOSTIC_RATE_VALUES[index]}")
+      done
+      for ((index = ${#DIAGNOSTIC_TRANSFER_DELAY_VALUES[@]} - 1;
+            index >= 0; index--)); do
+        ordered_diagnostic_transfer_delays+=(
+          "${DIAGNOSTIC_TRANSFER_DELAY_VALUES[index]}")
+      done
+      if [[ "${VARIANT_MODE}" == "paired" ]]; then
+        ordered_diagnostic_variants=(on off)
+      else
+        ordered_diagnostic_variants=("${VARIANT_MODE}")
+      fi
+    fi
+
+    for diagnostic_rate in "${ordered_diagnostic_rates[@]}"; do
+      for variant in "${ordered_diagnostic_variants[@]}"; do
+        for transfer_delay_ms in \
+            "${ordered_diagnostic_transfer_delays[@]}"; do
+          run_isolated_case \
+            "diagnostic" "${variant}" "${diagnostic_repetition}" \
+            "${diagnostic_rate}" "${diagnostic_prompts}" 1 \
+            "${transfer_delay_ms}"
+        done
       done
     done
   done

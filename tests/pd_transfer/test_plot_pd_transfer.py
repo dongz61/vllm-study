@@ -31,11 +31,18 @@ def _write_result(root, delay_ms, repetition=1):
 
 def test_generalization_delay_sweep_loads_and_plots_result_json(tmp_path):
     _write_result(tmp_path, 10)
+    _write_result(tmp_path, 10, repetition=2)
     _write_result(tmp_path, 50)
+    _write_result(tmp_path, 50, repetition=2)
 
     rows = load_generalization_delay_rows(tmp_path)
 
-    assert [row["transfer_delay_ms"] for row in rows] == [10.0, 50.0]
+    assert [(row["transfer_delay_ms"], row["repetition"]) for row in rows] == [
+        (10.0, 1),
+        (10.0, 2),
+        (50.0, 1),
+        (50.0, 2),
+    ]
     assert all(row["phase"] == "diagnostic" for row in rows)
     assert create_generalization_delay_sweeps(rows, tmp_path / "plots") == 1
     plots = list((tmp_path / "plots").rglob("*.png"))
