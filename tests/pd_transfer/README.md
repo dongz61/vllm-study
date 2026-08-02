@@ -312,9 +312,14 @@ GPU-memory calculation, commands, output fields, and interpretation guidance.
 ## Visualization
 
 After running the trace parser, `plot_pd_transfer.py` writes PNG figures plus
-`plot_summary.csv` under `<run-id>/plots` by default:
+`plot_summary.csv` and `generalization_delay_summary.csv` under
+`<run-id>/plots` by default:
 
 - `01_sleep_sweep`: fixed input and concurrency, varying injected sleep
+- `01_generalization_delay_sweep`: mixed-length generalization results grouped
+  by phase, workload, canonicalization variant, and configured request rate;
+  repeated measurements use the median with min--max error bars, and diagnostic
+  plots are explicitly labeled as trace-enabled
 - `02_kv_transfer_breakdown`: one pie per benchmark case, showing the
   mean-per-request connector time split across handshake, descriptor build,
   NIXL preparation/submission, observed completion, and other connector work
@@ -327,7 +332,9 @@ After running the trace parser, `plot_pd_transfer.py` writes PNG figures plus
   point is one Decode-side KV load-to-connector-finish latency; cold handshake
   requests are excluded by default
 
-The sleep-sweep charts show mean TTFT, p99 TTFT, and request throughput. The
+Both sleep-sweep chart types show mean TTFT, p99 TTFT, and request throughput.
+The generalization path reads `injected_transfer_delay_ms` directly from each
+`result.json`, so it supports both performance and diagnostic delay sweeps. The
 pie charts require `pd_request_timeline_ms.csv`, so run
 `parse_pd_trace.py` first. Use `--output-dir <path>` to place artifacts elsewhere.
 By default, pie charts exclude requests with a cold NIXL handshake so they

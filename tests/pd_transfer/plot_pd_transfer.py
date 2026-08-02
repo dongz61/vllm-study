@@ -5,6 +5,7 @@
 import argparse
 import csv
 import json
+import statistics
 from collections import defaultdict
 from pathlib import Path
 from typing import Any
@@ -118,6 +119,37 @@ def load_benchmark_rows(root: Path) -> list[dict[str, Any]]:
         row["concurrency"], row["sleep_ms"]))
 
 
+def load_generalization_delay_rows(root: Path) -> list[dict[str, Any]]:
+    """Load mixed-length generalization results with injected delay metadata."""
+    rows = []
+    for path in root.rglob("result.json"):
+        with path.open(encoding="utf-8-sig") as result_file:
+            result = json.load(result_file)
+        delay_ms = number(result.get("injected_transfer_delay_ms"))
+        if delay_ms is None:
+            continue
+        row: dict[str, Any] = {
+            "run_id": root.name,
+            "result_file": str(path),
+            "phase": str(result.get("phase", "unknown")),
+            "workload": str(result.get("workload", root.name)),
+            "variant": str(result.get("variant", "unknown")),
+            "repetition": int(result.get("repetition", 0)),
+            "configured_request_rate": str(
+                result.get("configured_request_rate", "unknown")),
+            "transfer_delay_ms": delay_ms,
+            "num_prompts": int(result.get("num_prompts", 0)),
+            "completed": int(result.get("completed", 0)),
+        }
+        for metric, _, _ in METRICS:
+            row[metric] = number(result.get(metric))
+        rows.append(row)
+    return sorted(rows, key=lambda row: (
+        row["phase"], row["workload"], row["variant"],
+        row["configured_request_rate"], row["transfer_delay_ms"],
+        row["repetition"]))
+
+
 def load_timeline_rows(root: Path) -> list[dict[str, Any]]:
     """Load formal benchmark requests with a transfer profile.
 
@@ -204,6 +236,101 @@ def create_sleep_sweeps(rows: list[dict[str, Any]], output_dir: Path) -> int:
                 f"concurrency-{concurrency}.png")
         save_sleep_sweep(items, title,
                          output_dir / run / "01_sleep_sweep" / name)
+        count += 1
+    return count
+
+
+def filename_slug(value: Any) -> str:
+    return "".join(character if character.isalnum() or character in "._-" else "-"
+                   for character in str(value)).strip("-") or "unknown"
+
+
+def save_generalization_delay_sweep(rows: list[dict[str, Any]], title: str,
+                                    destination: Path) -> None:
+    by_delay = {
+        key[0]: items
+        for key, items in grouped(rows, ("transfer_delay_ms", ))
+    }
+    delay_values = sorted(by_delay)
+    figure, axes = plt.subplots(1, 3, figsize=(15, 4.4), layout="constrained")
+    figure.suptitle(title, fontsize=13)
+    for axis, (metric, label, unit) in zip(axes, METRICS):
+        medians = []
+        minimum_errors = []
+        maximum_errors = []
+        repetition_counts = []
+        for delay_ms in delay_values:
+            values = [
+                value for row in by_delay[delay_ms]
+                if (value := number(row.get(metric))) is not None
+            ]
+            if not values:
+                medians.append(float("nan"))
+                minimum_errors.append(0.0)
+                maximum_errors.append(0.0)
+                repetition_counts.append(0)
+                continue
+            median_value = statistics.median(values)
+            medians.append(median_value)
+            minimum_errors.append(median_value - min(values))
+            maximum_errors.append(max(values) - median_value)
+            repetition_counts.append(len(values))
+        axis.errorbar(
+            delay_values,
+            medians,
+            yerr=[minimum_errors, maximum_errors],
+            marker="o",
+            linewidth=2,
+            capsize=4,
+            color="#1f77b4",
+        )
+        for delay_ms, value, repetitions in zip(
+                delay_values, medians, repetition_counts):
+            if repetitions:
+                suffix = f" (n={repetitions})" if repetitions > 1 else ""
+                axis.annotate(
+                    f"{value:.2f}{suffix}",
+                    (delay_ms, value),
+                    xytext=(0, 6),
+                    textcoords="offset points",
+                    ha="center",
+                    fontsize=8,
+                )
+        axis.set_xticks(delay_values)
+        axis.set_xticklabels([f"{value:g}" for value in delay_values])
+        axis.set_title(label)
+        axis.set_xlabel("Injected transfer completion delay (ms)")
+        axis.set_ylabel(unit)
+        axis.ticklabel_format(style="plain", axis="y", useOffset=False)
+        axis.grid(True, alpha=0.3)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    figure.savefig(destination, dpi=180)
+    plt.close(figure)
+
+
+def create_generalization_delay_sweeps(
+        rows: list[dict[str, Any]], output_dir: Path) -> int:
+    count = 0
+    fields = ("run_id", "phase", "workload", "variant",
+              "configured_request_rate")
+    for key, items in grouped(rows, fields):
+        if len({row["transfer_delay_ms"] for row in items}) < 2:
+            continue
+        run, phase, workload, variant, request_rate = key
+        trace_note = ", trace enabled" if phase == "diagnostic" else ""
+        title = (
+            f"Transfer-delay sweep ({phase}{trace_note})\n"
+            f"{workload}, variant={variant}, rate={request_rate}"
+        )
+        name = (
+            f"{filename_slug(phase)}-{filename_slug(workload)}-"
+            f"{filename_slug(variant)}-rps-{filename_slug(request_rate)}.png"
+        )
+        save_generalization_delay_sweep(
+            items,
+            title,
+            output_dir / run / "01_generalization_delay_sweep" / name,
+        )
         count += 1
     return count
 
@@ -411,6 +538,20 @@ def write_summary(path: Path, rows: list[dict[str, Any]]) -> None:
         writer.writerows(rows)
 
 
+def write_generalization_delay_summary(
+        path: Path, rows: list[dict[str, Any]]) -> None:
+    fields = [
+        "run_id", "phase", "workload", "variant", "repetition",
+        "configured_request_rate", "transfer_delay_ms", "num_prompts",
+        "completed", "result_file",
+    ]
+    fields.extend(metric for metric, _, _ in METRICS)
+    with path.open("w", newline="", encoding="utf-8") as summary_file:
+        writer = csv.DictWriter(summary_file, fieldnames=fields)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -427,9 +568,11 @@ def main() -> None:
     except ValueError as error:
         parser.error(str(error))
     benchmark_rows = load_benchmark_rows(root)
+    generalization_delay_rows = load_generalization_delay_rows(root)
     timeline_rows = load_timeline_rows(root)
     request_latency_rows = load_request_latency_rows(root)
-    if not benchmark_rows and not timeline_rows and not request_latency_rows:
+    if (not benchmark_rows and not generalization_delay_rows
+            and not timeline_rows and not request_latency_rows):
         parser.error(
             f"No PD benchmark JSON files or parsed request timelines found below {root}. "
             "Run parse_pd_trace.py first for trace-only diagnostic results."
@@ -437,7 +580,13 @@ def main() -> None:
     output_dir = (args.output_dir or root / "plots").resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     write_summary(output_dir / "plot_summary.csv", benchmark_rows)
+    write_generalization_delay_summary(
+        output_dir / "generalization_delay_summary.csv",
+        generalization_delay_rows,
+    )
     sleep_count = create_sleep_sweeps(benchmark_rows, output_dir)
+    generalization_delay_count = create_generalization_delay_sweeps(
+        generalization_delay_rows, output_dir)
     pie_count = create_transfer_pies(
         timeline_rows, output_dir,
         include_cold_handshake=args.include_cold_handshake)
@@ -446,7 +595,10 @@ def main() -> None:
     transfer_scatter_count = create_transfer_latency_scatters(timeline_rows,
                                                               output_dir,
                                                               args.include_cold_handshake)
-    print(f"Read {len(benchmark_rows)} cases; wrote {sleep_count} sleep sweeps, "
+    print(f"Read {len(benchmark_rows)} fixed-length cases and "
+          f"{len(generalization_delay_rows)} generalization delay cases; wrote "
+          f"{sleep_count} fixed-length sleep sweeps, "
+          f"{generalization_delay_count} generalization delay sweeps, "
           f"{pie_count} transfer pie charts, and {scatter_count} raw request "
           f"scatter plots, and {transfer_scatter_count} raw transfer scatter "
           f"plots under {output_dir}")
@@ -454,6 +606,7 @@ def main() -> None:
         print("No request timelines found; run parse_pd_trace.py first to create "
               "pd_request_timeline_ms.csv before plotting transfer pies.")
     print(f"Wrote {output_dir / 'plot_summary.csv'}")
+    print(f"Wrote {output_dir / 'generalization_delay_summary.csv'}")
 
 
 if __name__ == "__main__":
