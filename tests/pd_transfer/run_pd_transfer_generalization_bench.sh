@@ -597,6 +597,8 @@ start_vllm_server() {
   (
     export CUDA_VISIBLE_DEVICES="${devices}"
     export UCX_NET_DEVICES="${UCX_NET_DEVICES:-all}"
+    export UCX_LOG_LEVEL="${PD_UCX_LOG_LEVEL:-warn}"
+    export UCX_DEBUG_SIGNO=0
     export VLLM_NIXL_SIDE_CHANNEL_HOST="${HOST}"
     export VLLM_NIXL_SIDE_CHANNEL_PORT="${side_channel_port}"
     export VLLM_PD_TRANSFER_SLEEP_MS="${transfer_delay_ms}"
