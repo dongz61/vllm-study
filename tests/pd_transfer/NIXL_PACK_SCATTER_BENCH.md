@@ -68,7 +68,7 @@ python tests/pd_transfer/nixl_pack_scatter_bench.py \
   --kernel triton \
   --warmup 1 \
   --repeats 3 \
-  --nixl-label 1.3.2 \
+  --nixl-label 0.6.0 \
   --output results/nixl_pack_scatter_smoke.jsonl
 ```
 
@@ -79,6 +79,54 @@ normally `0` and `1`.
 PyTorch. `--kernel torch` is useful for debugging correctness, but it should
 not be used as the primary performance result because it is not the fused
 production-style path.
+
+## Controlled cost-model sweep
+
+Use `--runs-per-region` instead of `--patterns` to construct mappings with an
+exact paired forward-run count. Runs are ascending on both sides and separated
+by one unused physical block, so address order is not an additional variable.
+For a workload with `B` requested blocks and `K` runs per region:
+
+```text
+total_bytes = regions * B * block_bytes
+direct_descriptor_count = regions * B
+estimated_direct_backend_ranges = regions * K
+```
+
+The benchmark skips a requested `K` for cells where `K > B`. This produces a
+triangular grid from one global list:
+
+```bash
+UCX_MODULE_DIR=/path/to/nixl/ucx \
+UCX_MODULES=all \
+UCX_TLS=tcp,cuda \
+UCX_LOG_LEVEL=warn \
+UCX_PROTO_INFO=n \
+python tests/pd_transfer/nixl_pack_scatter_bench.py \
+  --target-gpu 3 \
+  --initiator-gpu 4 \
+  --regions 72 \
+  --physical-blocks 512 \
+  --request-blocks 1,2,4,8,16 \
+  --runs-per-region 1,2,4,8,16 \
+  --block-bytes 32768 \
+  --staging-mib 64 \
+  --kernel triton \
+  --warmup 5 \
+  --repeats 30 \
+  --nixl-label 0.6.0 \
+  --output results/pack_scatter/cost-model-core-0.6.0.jsonl
+```
+
+This command creates 15 workloads and 900 measured samples across the direct
+and packed paths. A logical block is 2.25 MiB with these settings, so the
+largest 16-block request is 36 MiB and every packed workload uses exactly one
+chunk. Holding `B` fixed isolates range count; holding `K` fixed varies request
+bytes while preserving vLLM's real relationship between physical blocks and
+submitted descriptors.
+
+`--patterns` and `--runs-per-region` are mutually exclusive. Existing pattern
+sweeps remain available for exploratory and external-validation experiments.
 
 ## Fragmentation sweep
 
@@ -98,7 +146,7 @@ python tests/pd_transfer/nixl_pack_scatter_bench.py \
   --kernel triton \
   --warmup 5 \
   --repeats 30 \
-  --nixl-label 1.3.2 \
+  --nixl-label 0.6.0 \
   --output results/nixl_pack_scatter_sweep.jsonl
 ```
 
@@ -122,6 +170,9 @@ Every JSONL sample records the exact `forward_range_count` and the corresponding
 `estimated_direct_backend_ranges = regions * forward_range_count`. Therefore,
 the analysis should use the measured range count rather than assuming that a
 pattern name always produces an exact number of fragments.
+
+Controlled mappings additionally record `mapping = "controlled"` and the
+numeric `runs_per_region`. Summaries group different run counts separately.
 
 ## Measurements
 

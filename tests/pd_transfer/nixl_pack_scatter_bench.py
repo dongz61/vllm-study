@@ -65,6 +65,7 @@ class Workload:
     local_block_ids: tuple[int, ...]
     remote_block_ids: tuple[int, ...]
     forward_range_count: int
+    runs_per_region: int | None = None
 
 
 def _load_nixl_api():
@@ -119,12 +120,9 @@ def _get_triton_kernels() -> tuple[Any, Any, Any]:
         offsets = tile_id * COPY_TILE + tl.arange(0, COPY_TILE)
         mask = offsets < block_bytes
         source_offsets = (
-            physical_block_id.to(tl.int64) * block_bytes.to(tl.int64)
-            + offsets
+            physical_block_id.to(tl.int64) * block_bytes.to(tl.int64) + offsets
         )
-        destination_offsets = (
-            row_id.to(tl.int64) * block_bytes.to(tl.int64) + offsets
-        )
+        destination_offsets = row_id.to(tl.int64) * block_bytes.to(tl.int64) + offsets
         values = tl.load(region_ptr + source_offsets, mask=mask)
         tl.store(staging + destination_offsets, values, mask=mask)
 
@@ -145,12 +143,9 @@ def _get_triton_kernels() -> tuple[Any, Any, Any]:
         physical_block_id = tl.load(block_ids + request_block_id)
         offsets = tile_id * COPY_TILE + tl.arange(0, COPY_TILE)
         mask = offsets < block_bytes
-        source_offsets = (
-            row_id.to(tl.int64) * block_bytes.to(tl.int64) + offsets
-        )
+        source_offsets = row_id.to(tl.int64) * block_bytes.to(tl.int64) + offsets
         destination_offsets = (
-            physical_block_id.to(tl.int64) * block_bytes.to(tl.int64)
-            + offsets
+            physical_block_id.to(tl.int64) * block_bytes.to(tl.int64) + offsets
         )
         values = tl.load(staging + source_offsets, mask=mask)
         tl.store(region_ptr + destination_offsets, values, mask=mask)
@@ -167,9 +162,7 @@ def _resolve_kernel(requested: str) -> str:
     except (ImportError, ModuleNotFoundError):
         if requested == "triton":
             raise
-        LOG.warning(
-            "Triton is unavailable; falling back to torch gather/scatter"
-        )
+        LOG.warning("Triton is unavailable; falling back to torch gather/scatter")
         return "torch"
     return "triton"
 
@@ -198,9 +191,7 @@ def _launch_pack(
         output = staging[:used_bytes].view(
             region_count, request_block_count, block_bytes
         )
-        torch.index_select(
-            source_arena[:, :-1, :], 1, block_ids, out=output
-        )
+        torch.index_select(source_arena[:, :-1, :], 1, block_ids, out=output)
         return
 
     triton, pack_kernel, _ = _get_triton_kernels()
@@ -274,8 +265,7 @@ def _shuffled_runs(
     random_generator: random.Random,
 ) -> list[int]:
     values = list(range(start, start + count))
-    runs = [values[index : index + run_length]
-            for index in range(0, count, run_length)]
+    runs = [values[index : index + run_length] for index in range(0, count, run_length)]
     random_generator.shuffle(runs)
     return [value for run in runs for value in run]
 
@@ -304,9 +294,7 @@ def _build_mapping(
     elif pattern == "mixed":
         local_rng = random.Random(seed ^ 0x51A7)
         remote_rng = random.Random(seed ^ 0xA715)
-        local = _shuffled_runs(
-            0, request_blocks, mixed_run_length, local_rng
-        )
+        local = _shuffled_runs(0, request_blocks, mixed_run_length, local_rng)
         remote = _shuffled_runs(
             remote_start, request_blocks, mixed_run_length, remote_rng
         )
@@ -327,14 +315,66 @@ def _build_mapping(
     )
 
 
+def _build_controlled_mapping(
+    request_blocks: int,
+    physical_blocks: int,
+    runs_per_region: int,
+) -> Workload:
+    """Build paired ascending block lists with an exact number of runs.
+
+    Runs are separated by one unused physical block.  The local and remote
+    lists have the same run lengths but occupy opposite ends of their arenas.
+    Consequently, bytes and submitted descriptor count depend only on
+    ``request_blocks`` while the paired forward-range count is exactly
+    ``runs_per_region``.
+    """
+    if request_blocks <= 0 or request_blocks > physical_blocks:
+        raise ValueError("request_blocks must be in [1, physical_blocks]")
+    if runs_per_region <= 0 or runs_per_region > request_blocks:
+        raise ValueError("runs_per_region must be in [1, request_blocks]")
+
+    required_span = request_blocks + runs_per_region - 1
+    if required_span > physical_blocks:
+        raise ValueError(
+            "physical_blocks must be at least request_blocks + " "runs_per_region - 1"
+        )
+
+    base_length, longer_run_count = divmod(request_blocks, runs_per_region)
+    run_lengths = [
+        base_length + (run_index < longer_run_count)
+        for run_index in range(runs_per_region)
+    ]
+
+    def build_ids(start: int) -> tuple[int, ...]:
+        block_ids = []
+        cursor = start
+        for run_length in run_lengths:
+            block_ids.extend(range(cursor, cursor + run_length))
+            cursor += run_length + 1
+        return tuple(block_ids)
+
+    local = build_ids(0)
+    remote = build_ids(physical_blocks - required_span)
+    forward_range_count = _count_forward_ranges(local, remote)
+    assert forward_range_count == runs_per_region
+    return Workload(
+        pattern="controlled",
+        request_blocks=request_blocks,
+        local_block_ids=local,
+        remote_block_ids=remote,
+        forward_range_count=forward_range_count,
+        runs_per_region=runs_per_region,
+    )
+
+
 def _descriptor_indices(
     block_ids: tuple[int, ...] | list[int],
     region_count: int,
     physical_blocks: int,
 ) -> np.ndarray:
-    region_offsets = (
-        np.arange(region_count, dtype=np.int64) * physical_blocks
-    )[:, None]
+    region_offsets = (np.arange(region_count, dtype=np.int64) * physical_blocks)[
+        :, None
+    ]
     blocks = np.asarray(block_ids, dtype=np.int64)[None, :]
     indices = region_offsets + blocks
     if indices.size and indices.max() > np.iinfo(np.int32).max:
@@ -342,9 +382,7 @@ def _descriptor_indices(
     return indices.ravel().astype(np.int32)
 
 
-def _chunk_ranges(
-    request_blocks: int, blocks_per_chunk: int
-) -> list[tuple[int, int]]:
+def _chunk_ranges(request_blocks: int, blocks_per_chunk: int) -> list[tuple[int, int]]:
     if request_blocks <= 0 or blocks_per_chunk <= 0:
         raise ValueError("request_blocks and blocks_per_chunk must be positive")
     return [
@@ -353,9 +391,7 @@ def _chunk_ranges(
     ]
 
 
-def _make_kv_views(
-    arena, region_count: int, physical_blocks: int, block_bytes: int
-):
+def _make_kv_views(arena, region_count: int, physical_blocks: int, block_bytes: int):
     views = []
     for region in range(region_count):
         flat_region = arena[region].view(-1)
@@ -366,9 +402,7 @@ def _make_kv_views(
     return views
 
 
-def _make_staging_views(
-    staging, region_count: int, max_blocks: int, block_bytes: int
-):
+def _make_staging_views(staging, region_count: int, max_blocks: int, block_bytes: int):
     return [
         staging.narrow(0, 0, region_count * count * block_bytes)
         for count in range(1, max_blocks + 1)
@@ -382,7 +416,7 @@ def _fill_source_pattern(torch, arena, physical_blocks: int) -> None:
     block_values = torch.arange(
         physical_blocks, dtype=torch.int64, device=arena.device
     )[None, :]
-    values = ((region_values * 131 + block_values * 17) % PATTERN_MODULUS)
+    values = (region_values * 131 + block_values * 17) % PATTERN_MODULUS
     valid = arena[:, :physical_blocks, :]
     valid.copy_(values.to(torch.uint8)[..., None])
     # Encode the full region/block identity in the first four bytes.  The
@@ -429,25 +463,17 @@ def _target_worker(connection, config: dict[str, Any]) -> None:
             dtype=torch.uint8,
             device=device,
         )
-        send_staging = torch.empty(
-            staging_bytes, dtype=torch.uint8, device=device
-        )
+        send_staging = torch.empty(staging_bytes, dtype=torch.uint8, device=device)
         _fill_source_pattern(torch, source_arena, physical_blocks)
         source_region_ptrs = _region_ptrs(torch, source_arena)
         pack_stream = torch.cuda.Stream(device=device)
         torch.cuda.synchronize(device)
 
         agent = _make_agent("target")
-        registrations.append(
-            agent.register_memory(source_arena, backends=["UCX"])
-        )
-        registrations.append(
-            agent.register_memory(send_staging, backends=["UCX"])
-        )
+        registrations.append(agent.register_memory(source_arena, backends=["UCX"]))
+        registrations.append(agent.register_memory(send_staging, backends=["UCX"]))
         source_xfer_descs = agent.get_xfer_descs(
-            _make_kv_views(
-                source_arena, region_count, physical_blocks, block_bytes
-            )
+            _make_kv_views(source_arena, region_count, physical_blocks, block_bytes)
         )
         staging_xfer_descs = agent.get_xfer_descs(
             _make_staging_views(
@@ -459,9 +485,7 @@ def _target_worker(connection, config: dict[str, Any]) -> None:
                 "type": "ready",
                 "metadata": agent.get_agent_metadata(),
                 "source_descs": agent.get_serialized_descs(source_xfer_descs),
-                "staging_descs": agent.get_serialized_descs(
-                    staging_xfer_descs
-                ),
+                "staging_descs": agent.get_serialized_descs(staging_xfer_descs),
             }
         )
 
@@ -526,9 +550,7 @@ def _target_worker(connection, config: dict[str, Any]) -> None:
             )
     except BaseException:
         try:
-            connection.send(
-                {"type": "error", "traceback": traceback.format_exc()}
-            )
+            connection.send({"type": "error", "traceback": traceback.format_exc()})
         except BaseException:
             pass
     finally:
@@ -614,6 +636,7 @@ def _base_sample(
     return {
         "path": path,
         "mapping": workload.pattern,
+        "runs_per_region": workload.runs_per_region,
         "request_blocks": workload.request_blocks,
         "regions": region_count,
         "block_bytes": block_bytes,
@@ -771,9 +794,7 @@ def _run_packed(
         totals["destination_index_build_ns"] += (
             destination_index_end_ns - destination_index_start_ns
         )
-        totals["pack_control_wait_ns"] += (
-            pack_wait_end_ns - pack_wait_start_ns
-        )
+        totals["pack_control_wait_ns"] += pack_wait_end_ns - pack_wait_start_ns
         totals["pack_gpu_ns"] += packed["pack_gpu_ns"]
         totals["scatter_gpu_ns"] += scatter_gpu_ns
         for field in (
@@ -788,9 +809,7 @@ def _run_packed(
 
     done_ns = time.perf_counter_ns()
     data_path_ns = (
-        totals["pack_gpu_ns"]
-        + totals["transfer_total_ns"]
-        + totals["scatter_gpu_ns"]
+        totals["pack_gpu_ns"] + totals["transfer_total_ns"] + totals["scatter_gpu_ns"]
     )
     sample = _base_sample(workload, "packed", region_count, block_bytes)
     sample.update(
@@ -798,9 +817,7 @@ def _run_packed(
             "chunks": len(chunks),
             "packed_descriptor_count": len(chunks),
             "source_index_build_ns": totals["source_index_build_ns"],
-            "destination_index_build_ns": totals[
-                "destination_index_build_ns"
-            ],
+            "destination_index_build_ns": totals["destination_index_build_ns"],
             "pack_control_wait_ns": totals["pack_control_wait_ns"],
             "pack_gpu_ns": totals["pack_gpu_ns"],
             "scatter_gpu_ns": totals["scatter_gpu_ns"],
@@ -811,9 +828,7 @@ def _run_packed(
             "data_path_ns": data_path_ns,
             "wall_ns": done_ns - start_ns,
             "effective_gbps": (
-                sample["total_bytes"] / data_path_ns
-                if data_path_ns
-                else None
+                sample["total_bytes"] / data_path_ns if data_path_ns else None
             ),
             "initial_state": ",".join(initial_states),
             "poll_count": poll_count,
@@ -842,34 +857,26 @@ def _verify_destination(torch, destination_arena, workload: Workload) -> bool:
         dtype=torch.int64,
         device=destination_arena.device,
     )[None, :]
-    expected = ((regions * 131 + remote_ids * 17) % PATTERN_MODULUS)
-    selected_ok = bool(
-        selected[:, :, 4:].eq(expected.to(torch.uint8)[..., None]).all()
-    )
+    expected = (regions * 131 + remote_ids * 17) % PATTERN_MODULUS
+    selected_ok = bool(selected[:, :, 4:].eq(expected.to(torch.uint8)[..., None]).all())
     selected_ok = selected_ok and bool(
         selected[:, :, 0].eq((remote_ids & 0xFF).to(torch.uint8)).all()
     )
     selected_ok = selected_ok and bool(
-        selected[:, :, 1]
-        .eq(((remote_ids >> 8) & 0xFF).to(torch.uint8))
-        .all()
+        selected[:, :, 1].eq(((remote_ids >> 8) & 0xFF).to(torch.uint8)).all()
     )
     selected_ok = selected_ok and bool(
         selected[:, :, 2].eq((regions & 0xFF).to(torch.uint8)).all()
     )
     selected_ok = selected_ok and bool(
-        selected[:, :, 3]
-        .eq(((regions >> 8) & 0xFF).to(torch.uint8))
-        .all()
+        selected[:, :, 3].eq(((regions >> 8) & 0xFF).to(torch.uint8)).all()
     )
 
     untouched_mask = torch.ones(
         physical_blocks, dtype=torch.bool, device=destination_arena.device
     )
     untouched_mask[local_ids] = False
-    untouched_first_bytes = destination_arena[
-        :, :physical_blocks, 0
-    ][:, untouched_mask]
+    untouched_first_bytes = destination_arena[:, :physical_blocks, 0][:, untouched_mask]
     untouched_ok = bool(untouched_first_bytes.eq(DESTINATION_SENTINEL).all())
     return selected_ok and untouched_ok
 
@@ -886,9 +893,15 @@ def _percentile(values: list[int | float], percentile: float) -> float:
 
 
 def _summaries(samples: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    groups: dict[tuple[str, int, str], list[dict[str, Any]]] = defaultdict(list)
+    groups: dict[tuple[str, int, int, str], list[dict[str, Any]]] = defaultdict(list)
     for sample in samples:
-        key = (sample["mapping"], sample["request_blocks"], sample["path"])
+        runs_per_region = sample.get("runs_per_region")
+        key = (
+            sample["mapping"],
+            sample["request_blocks"],
+            -1 if runs_per_region is None else runs_per_region,
+            sample["path"],
+        )
         groups[key].append(sample)
 
     timing_fields = (
@@ -911,7 +924,8 @@ def _summaries(samples: list[dict[str, Any]]) -> list[dict[str, Any]]:
             "record_type": "summary",
             "mapping": key[0],
             "request_blocks": key[1],
-            "path": key[2],
+            "runs_per_region": None if key[2] == -1 else key[2],
+            "path": key[3],
             "sample_count": len(group),
             "regions": group[0]["regions"],
             "block_bytes": group[0]["block_bytes"],
@@ -920,6 +934,7 @@ def _summaries(samples: list[dict[str, Any]]) -> list[dict[str, Any]]:
             "estimated_direct_backend_ranges": group[0][
                 "estimated_direct_backend_ranges"
             ],
+            "direct_descriptor_count": group[0]["direct_descriptor_count"],
             "chunks": group[0]["chunks"],
         }
         for field in timing_fields:
@@ -985,6 +1000,10 @@ def _runtime_record(args, torch, kernel: str, blocks_per_chunk: int):
         "physical_blocks": args.physical_blocks,
         "request_blocks": args.request_blocks,
         "patterns": args.patterns,
+        "runs_per_region": args.runs_per_region,
+        "workload_mode": (
+            "controlled_runs" if args.runs_per_region_counts is not None else "patterns"
+        ),
         "block_bytes": args.block_bytes,
         "staging_bytes": args.staging_mib * 1024 * 1024,
         "blocks_per_chunk": blocks_per_chunk,
@@ -1004,11 +1023,7 @@ def _runtime_record(args, torch, kernel: str, blocks_per_chunk: int):
 
 def _parse_csv_ints(parser, text: str, option: str) -> list[int]:
     try:
-        values = [
-            int(value.strip())
-            for value in text.split(",")
-            if value.strip()
-        ]
+        values = [int(value.strip()) for value in text.split(",") if value.strip()]
     except ValueError:
         parser.error(f"{option} must be a comma-separated integer list")
     if not values or any(value <= 0 for value in values):
@@ -1032,25 +1047,35 @@ def _parse_args() -> argparse.Namespace:
         default="4,16,64",
         help="Comma-separated logical block counts.",
     )
-    parser.add_argument(
+    mapping_group = parser.add_mutually_exclusive_group()
+    mapping_group.add_argument(
         "--patterns",
-        default="forward,mixed,fragmented",
-        help="Comma-separated values from: " + ",".join(SUPPORTED_PATTERNS),
+        default=None,
+        help=(
+            "Comma-separated values from: "
+            + ",".join(SUPPORTED_PATTERNS)
+            + ". Defaults to forward,mixed,fragmented when neither mapping "
+            "option is supplied."
+        ),
+    )
+    mapping_group.add_argument(
+        "--runs-per-region",
+        default=None,
+        help=(
+            "Comma-separated exact paired forward-run counts. Values larger "
+            "than a request block count are skipped for that block count."
+        ),
     )
     parser.add_argument("--mixed-run-length", type=int, default=4)
     parser.add_argument("--block-bytes", type=int, default=32 * 1024)
     parser.add_argument("--staging-mib", type=int, default=64)
-    parser.add_argument(
-        "--kernel", choices=("auto", "triton", "torch"), default="auto"
-    )
+    parser.add_argument("--kernel", choices=("auto", "triton", "torch"), default="auto")
     parser.add_argument("--warmup", type=int, default=3)
     parser.add_argument("--repeats", type=int, default=20)
     parser.add_argument("--seed", type=int, default=20260801)
     parser.add_argument("--timeout-seconds", type=float, default=30.0)
     parser.add_argument("--nixl-label", default="auto")
-    parser.add_argument(
-        "--output", default="nixl_pack_scatter_results.jsonl"
-    )
+    parser.add_argument("--output", default="nixl_pack_scatter_results.jsonl")
     parser.add_argument("--overwrite", action="store_true")
     args = parser.parse_args()
 
@@ -1075,12 +1100,41 @@ def _parse_args() -> argparse.Namespace:
     )
     if max(args.request_block_counts) > args.physical_blocks:
         parser.error("request block count cannot exceed --physical-blocks")
-    args.pattern_names = [
-        value.strip() for value in args.patterns.split(",") if value.strip()
-    ]
-    invalid_patterns = sorted(set(args.pattern_names) - set(SUPPORTED_PATTERNS))
-    if not args.pattern_names or invalid_patterns:
-        parser.error(f"invalid --patterns values: {invalid_patterns}")
+    args.runs_per_region_counts = None
+    if args.runs_per_region is None:
+        if args.patterns is None:
+            args.patterns = "forward,mixed,fragmented"
+        args.pattern_names = [
+            value.strip() for value in args.patterns.split(",") if value.strip()
+        ]
+        invalid_patterns = sorted(set(args.pattern_names) - set(SUPPORTED_PATTERNS))
+        if not args.pattern_names or invalid_patterns:
+            parser.error(f"invalid --patterns values: {invalid_patterns}")
+    else:
+        args.pattern_names = []
+        args.runs_per_region_counts = _parse_csv_ints(
+            parser, args.runs_per_region, "--runs-per-region"
+        )
+        max_request_blocks = max(args.request_block_counts)
+        if max(args.runs_per_region_counts) > max_request_blocks:
+            parser.error("run count cannot exceed every --request-blocks value")
+        for request_blocks in args.request_block_counts:
+            eligible_runs = [
+                run_count
+                for run_count in args.runs_per_region_counts
+                if run_count <= request_blocks
+            ]
+            if not eligible_runs:
+                parser.error(
+                    "each request block count must have at least one eligible "
+                    "--runs-per-region value"
+                )
+            for run_count in eligible_runs:
+                if request_blocks + run_count - 1 > args.physical_blocks:
+                    parser.error(
+                        "controlled mappings require --physical-blocks >= "
+                        "request_blocks + runs_per_region - 1"
+                    )
 
     staging_bytes = args.staging_mib * 1024 * 1024
     logical_block_bytes = args.regions * args.block_bytes
@@ -1123,17 +1177,29 @@ def main() -> int:
     staging_bytes = args.staging_mib * 1024 * 1024
     logical_block_bytes = args.regions * args.block_bytes
     blocks_per_chunk = staging_bytes // logical_block_bytes
-    workloads = [
-        _build_mapping(
-            pattern,
-            request_blocks,
-            args.physical_blocks,
-            args.seed ^ request_blocks,
-            args.mixed_run_length,
-        )
-        for request_blocks in args.request_block_counts
-        for pattern in args.pattern_names
-    ]
+    if args.runs_per_region_counts is None:
+        workloads = [
+            _build_mapping(
+                pattern,
+                request_blocks,
+                args.physical_blocks,
+                args.seed ^ request_blocks,
+                args.mixed_run_length,
+            )
+            for request_blocks in args.request_block_counts
+            for pattern in args.pattern_names
+        ]
+    else:
+        workloads = [
+            _build_controlled_mapping(
+                request_blocks,
+                args.physical_blocks,
+                runs_per_region,
+            )
+            for request_blocks in args.request_block_counts
+            for runs_per_region in args.runs_per_region_counts
+            if runs_per_region <= request_blocks
+        ]
 
     config = {
         "target_gpu": args.target_gpu,
@@ -1164,9 +1230,7 @@ def main() -> int:
             parent_connection, args.timeout_seconds
         )
         if target_message.get("type") != "ready":
-            raise RuntimeError(
-                f"unexpected target ready message: {target_message!r}"
-            )
+            raise RuntimeError(f"unexpected target ready message: {target_message!r}")
 
         torch.cuda.set_device(args.initiator_gpu)
         device = torch.device("cuda", args.initiator_gpu)
@@ -1176,38 +1240,26 @@ def main() -> int:
             dtype=torch.uint8,
             device=device,
         )
-        receive_staging = torch.empty(
-            staging_bytes, dtype=torch.uint8, device=device
-        )
+        receive_staging = torch.empty(staging_bytes, dtype=torch.uint8, device=device)
         destination_region_ptrs = _region_ptrs(torch, destination_arena)
         scatter_stream = torch.cuda.Stream(device=device)
         torch.cuda.synchronize(device)
 
         agent = _make_agent("initiator")
-        registrations.append(
-            agent.register_memory(destination_arena, backends=["UCX"])
-        )
-        registrations.append(
-            agent.register_memory(receive_staging, backends=["UCX"])
-        )
+        registrations.append(agent.register_memory(destination_arena, backends=["UCX"]))
+        registrations.append(agent.register_memory(receive_staging, backends=["UCX"]))
         remote_name = agent.add_remote_agent(target_message["metadata"])
         if _agent_name_text(remote_name) != "target":
-            raise RuntimeError(
-                f"loaded unexpected remote agent name: {remote_name!r}"
-            )
+            raise RuntimeError(f"loaded unexpected remote agent name: {remote_name!r}")
         parent_connection.send(
             {"type": "add_remote", "metadata": agent.get_agent_metadata()}
         )
-        remote_ack = _receive_target_message(
-            parent_connection, args.timeout_seconds
-        )
+        remote_ack = _receive_target_message(parent_connection, args.timeout_seconds)
         if (
             remote_ack.get("type") != "remote_added"
             or remote_ack.get("remote_name") != "initiator"
         ):
-            raise RuntimeError(
-                f"unexpected remote acknowledgement: {remote_ack!r}"
-            )
+            raise RuntimeError(f"unexpected remote acknowledgement: {remote_ack!r}")
 
         local_direct_descs = agent.get_xfer_descs(
             _make_kv_views(
@@ -1225,12 +1277,8 @@ def main() -> int:
                 args.block_bytes,
             )
         )
-        remote_direct_descs = agent.deserialize_descs(
-            target_message["source_descs"]
-        )
-        remote_staging_descs = agent.deserialize_descs(
-            target_message["staging_descs"]
-        )
+        remote_direct_descs = agent.deserialize_descs(target_message["source_descs"])
+        remote_staging_descs = agent.deserialize_descs(target_message["staging_descs"])
         local_direct_prepped = agent.prep_xfer_dlist(
             "NIXL_INIT_AGENT", local_direct_descs, backends=["UCX"]
         )
@@ -1282,8 +1330,7 @@ def main() -> int:
                 timeout_seconds=args.timeout_seconds,
             )
 
-        cells = [(workload, path) for workload in workloads
-                 for path in SUPPORTED_PATHS]
+        cells = [(workload, path) for workload in workloads for path in SUPPORTED_PATHS]
         random_generator = random.Random(args.seed)
         with _output_stream(args.output, args.overwrite) as output:
             _write_record(
@@ -1303,9 +1350,7 @@ def main() -> int:
                 random_generator.shuffle(schedule)
                 for workload, path in schedule:
                     sample = run_cell(workload, path)
-                    sample.update(
-                        {"record_type": "sample", "repeat": repeat}
-                    )
+                    sample.update({"record_type": "sample", "repeat": repeat})
                     samples.append(sample)
                     _write_record(output, sample)
 
@@ -1314,12 +1359,11 @@ def main() -> int:
                 torch.cuda.synchronize(device)
                 run_cell(workload, path)
                 torch.cuda.synchronize(device)
-                passed = _verify_destination(
-                    torch, destination_arena, workload
-                )
+                passed = _verify_destination(torch, destination_arena, workload)
                 correctness = {
                     "record_type": "correctness",
                     "mapping": workload.pattern,
+                    "runs_per_region": workload.runs_per_region,
                     "request_blocks": workload.request_blocks,
                     "path": path,
                     "passed": passed,

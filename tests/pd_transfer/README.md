@@ -307,8 +307,9 @@ of this harness.
 `nixl_pack_scatter_bench.py` compares the current direct region-by-block NIXL
 READ path against bounded GPU gather, contiguous READ, and GPU scatter without
 starting vLLM. It includes fused Triton and PyTorch reference kernels, four
-synthetic mapping patterns, fixed-size chunking, CUDA-event timing, randomized
-A/B ordering, and independent correctness checks.
+synthetic mapping patterns, exact `runs_per_region` mappings for controlled
+bytes/range cost-model sweeps, fixed-size chunking, CUDA-event timing,
+randomized A/B ordering, and independent correctness checks.
 
 See [NIXL_PACK_SCATTER_BENCH.md](NIXL_PACK_SCATTER_BENCH.md) for the design,
 GPU-memory calculation, commands, output fields, and interpretation guidance.
