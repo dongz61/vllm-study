@@ -78,6 +78,15 @@ The resolved mode and staging parameters are written to
 `experiment_config.json`, while detailed traces record the selected path and
 the exact `B` and `K` for every transfer.
 
+Packed profiles also split source-side control contention into cumulative and
+maximum-per-chunk measurements. `packed_source_handler_ms` covers time inside
+the Prefill control handler, `packed_source_sync_wall_ms` covers its blocking
+CUDA synchronization, and `packed_source_stream_wait_gpu_ms` measures the GPU
+timeline spent waiting for the Prefill default stream. The corresponding
+`*_max_ms` fields expose a single slow chunk, while
+`packed_pack_control_other_ms` retains transport, queueing, and Decode polling
+time not accounted for by the source handler.
+
 When detailed PD tracing is enabled, the connector also estimates the remaining
 pair-preserving reorder opportunity without changing the submitted descriptors:
 

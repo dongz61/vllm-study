@@ -509,6 +509,12 @@ class _NixlTransferTraceState:
     packed_chunk_count: int = 0
     packed_pack_control_total_ns: int = 0
     packed_pack_gpu_total_ns: int = 0
+    packed_source_handler_total_ns: int = 0
+    packed_source_handler_max_ns: int = 0
+    packed_source_sync_wall_total_ns: int = 0
+    packed_source_sync_wall_max_ns: int = 0
+    packed_source_stream_wait_gpu_total_ns: int = 0
+    packed_source_stream_wait_gpu_max_ns: int = 0
     packed_scatter_gpu_total_ns: int = 0
 
 
@@ -1328,6 +1334,7 @@ class NixlConnectorWorker:
     def _handle_packed_control(
             self, request: dict[str, Any]) -> Optional[dict[str, Any]]:
         """Run in the side-channel thread on the source/Prefill worker."""
+        handler_start_ns = time.perf_counter_ns()
         if request.get("version") != _PACK_CONTROL_VERSION:
             raise ValueError("unsupported packed control protocol version")
         message_type = request.get("type")
@@ -1356,6 +1363,9 @@ class NixlConnectorWorker:
                 "remote_slot": self._packed_source_slots[key],
                 "block_count": len(request.get("block_ids", [])),
                 "pack_gpu_ns": 0,
+                "source_handler_ns": 0,
+                "source_sync_wall_ns": 0,
+                "source_stream_wait_gpu_ns": 0,
             }
         if not self._packed_source_free_slots:
             return {
@@ -1381,24 +1391,42 @@ class NixlConnectorWorker:
             staging = self._packed_staging.narrow(
                 0, slot * self._packed_slot_bytes, self._packed_slot_bytes)
             device = self._packed_staging.device
+            stream_wait_start_event = None
+            stream_wait_end_event = None
+            if self._pd_trace_enabled:
+                stream_wait_start_event = torch.cuda.Event(enable_timing=True)
+                stream_wait_end_event = torch.cuda.Event(enable_timing=True)
             start_event = torch.cuda.Event(enable_timing=True)
             end_event = torch.cuda.Event(enable_timing=True)
-            self._packed_pack_stream.wait_stream(
-                torch.cuda.default_stream(device))
             with torch.cuda.device(device), torch.cuda.stream(
                     self._packed_pack_stream):
+                if stream_wait_start_event is not None:
+                    stream_wait_start_event.record(self._packed_pack_stream)
+                self._packed_pack_stream.wait_stream(
+                    torch.cuda.default_stream(device))
+                if stream_wait_end_event is not None:
+                    stream_wait_end_event.record(self._packed_pack_stream)
                 ids = torch.tensor(block_ids, dtype=torch.int64, device=device)
                 start_event.record(self._packed_pack_stream)
                 _launch_pack_regions(self._packed_region_ptrs, ids, staging,
                                      self._packed_block_bytes)
                 end_event.record(self._packed_pack_stream)
+            sync_start_ns = time.perf_counter_ns()
             end_event.synchronize()
+            sync_end_ns = time.perf_counter_ns()
             pack_gpu_ns = int(start_event.elapsed_time(end_event) * 1_000_000)
+            stream_wait_gpu_ns = 0
+            if (stream_wait_start_event is not None
+                    and stream_wait_end_event is not None):
+                stream_wait_gpu_ns = int(
+                    stream_wait_start_event.elapsed_time(stream_wait_end_event)
+                    * 1_000_000)
         except BaseException:
             self._packed_source_slots.pop(key, None)
             self._packed_source_free_slots.appendleft(slot)
             raise
 
+        handler_end_ns = time.perf_counter_ns()
         return {
             "version": _PACK_CONTROL_VERSION,
             "type": "ready",
@@ -1406,6 +1434,9 @@ class NixlConnectorWorker:
             "remote_slot": slot,
             "block_count": len(block_ids),
             "pack_gpu_ns": pack_gpu_ns,
+            "source_handler_ns": handler_end_ns - handler_start_ns,
+            "source_sync_wall_ns": sync_end_ns - sync_start_ns,
+            "source_stream_wait_gpu_ns": stream_wait_gpu_ns,
         }
 
     def _get_packed_control_socket(self,
@@ -2101,6 +2132,22 @@ class NixlConnectorWorker:
                 state.packed_pack_control_total_ns / 1_000_000, 6),
             packed_pack_gpu_ms=round(
                 state.packed_pack_gpu_total_ns / 1_000_000, 6),
+            packed_source_handler_ms=round(
+                state.packed_source_handler_total_ns / 1_000_000, 6),
+            packed_source_handler_max_ms=round(
+                state.packed_source_handler_max_ns / 1_000_000, 6),
+            packed_source_sync_wall_ms=round(
+                state.packed_source_sync_wall_total_ns / 1_000_000, 6),
+            packed_source_sync_wall_max_ms=round(
+                state.packed_source_sync_wall_max_ns / 1_000_000, 6),
+            packed_source_stream_wait_gpu_ms=round(
+                state.packed_source_stream_wait_gpu_total_ns / 1_000_000, 6),
+            packed_source_stream_wait_gpu_max_ms=round(
+                state.packed_source_stream_wait_gpu_max_ns / 1_000_000, 6),
+            packed_pack_control_other_ms=round(
+                max(
+                    0, state.packed_pack_control_total_ns -
+                    state.packed_source_handler_total_ns) / 1_000_000, 6),
             packed_scatter_gpu_ms=round(
                 state.packed_scatter_gpu_total_ns / 1_000_000, 6),
             handshake_cached=state.handshake_cached,
@@ -2580,6 +2627,32 @@ class NixlConnectorWorker:
                             if isinstance(pack_gpu_ns, int):
                                 trace_state.packed_pack_gpu_total_ns += (
                                     pack_gpu_ns)
+                            source_handler_ns = response.get(
+                                "source_handler_ns", 0)
+                            if isinstance(source_handler_ns, int):
+                                trace_state.packed_source_handler_total_ns += (
+                                    source_handler_ns)
+                                trace_state.packed_source_handler_max_ns = max(
+                                    trace_state.packed_source_handler_max_ns,
+                                    source_handler_ns)
+                            source_sync_wall_ns = response.get(
+                                "source_sync_wall_ns", 0)
+                            if isinstance(source_sync_wall_ns, int):
+                                trace_state.packed_source_sync_wall_total_ns += (
+                                    source_sync_wall_ns)
+                                trace_state.packed_source_sync_wall_max_ns = max(
+                                    trace_state.packed_source_sync_wall_max_ns,
+                                    source_sync_wall_ns)
+                            source_stream_wait_gpu_ns = response.get(
+                                "source_stream_wait_gpu_ns", 0)
+                            if isinstance(source_stream_wait_gpu_ns, int):
+                                profile = trace_state
+                                profile.packed_source_stream_wait_gpu_total_ns += (
+                                    source_stream_wait_gpu_ns)
+                                profile.packed_source_stream_wait_gpu_max_ns = max(
+                                    profile
+                                    .packed_source_stream_wait_gpu_max_ns,
+                                    source_stream_wait_gpu_ns)
                 remote_slot = response.get("remote_slot")
                 if not isinstance(remote_slot, int) or remote_slot < 0:
                     raise RuntimeError("invalid remote packed staging slot")

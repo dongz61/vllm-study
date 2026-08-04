@@ -1294,6 +1294,14 @@ def test_pd_transfer_profile_is_emitted_once():
             reverse_block_pair_canonicalization_enabled=True,
             canonicalized_reverse_run_count=2,
             canonicalized_reverse_block_count=16,
+            packed_chunk_count=2,
+            packed_pack_control_total_ns=10_000_000,
+            packed_source_handler_total_ns=6_000_000,
+            packed_source_handler_max_ns=4_000_000,
+            packed_source_sync_wall_total_ns=5_000_000,
+            packed_source_sync_wall_max_ns=3_000_000,
+            packed_source_stream_wait_gpu_total_ns=4_000_000,
+            packed_source_stream_wait_gpu_max_ns=2_500_000,
         )
     }
     module = "vllm.distributed.kv_transfer.kv_connector.v1.nixl_connector"
@@ -1330,6 +1338,13 @@ def test_pd_transfer_profile_is_emitted_once():
     assert fields["reverse_block_pair_canonicalization_enabled"] is True
     assert fields["canonicalized_reverse_run_count"] == 2
     assert fields["canonicalized_reverse_block_count"] == 16
+    assert fields["packed_source_handler_ms"] == 6.0
+    assert fields["packed_source_handler_max_ms"] == 4.0
+    assert fields["packed_source_sync_wall_ms"] == 5.0
+    assert fields["packed_source_sync_wall_max_ms"] == 3.0
+    assert fields["packed_source_stream_wait_gpu_ms"] == 4.0
+    assert fields["packed_source_stream_wait_gpu_max_ms"] == 2.5
+    assert fields["packed_pack_control_other_ms"] == 4.0
     assert worker._transfer_trace_states == {}
 
 
