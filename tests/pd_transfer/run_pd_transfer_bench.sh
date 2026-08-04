@@ -23,11 +23,36 @@ case "${CANONICALIZE_REVERSE_BLOCK_PAIRS:-0}" in
     ;;
 esac
 
+NIXL_TRANSFER_MODE=${NIXL_TRANSFER_MODE:-direct}
+case "${NIXL_TRANSFER_MODE}" in
+  direct|packed|auto)
+    ;;
+  *)
+    echo "NIXL_TRANSFER_MODE must be direct, packed, or auto" >&2
+    exit 1
+    ;;
+esac
+NIXL_PACKED_STAGING_MIB=${NIXL_PACKED_STAGING_MIB:-64}
+NIXL_PACKED_STAGING_SLOTS=${NIXL_PACKED_STAGING_SLOTS:-2}
+NIXL_PACKED_AUTO_RANGE_THRESHOLD=${NIXL_PACKED_AUTO_RANGE_THRESHOLD:-16}
+NIXL_PACKED_AUTO_BLOCK_THRESHOLD=${NIXL_PACKED_AUTO_BLOCK_THRESHOLD:-32}
+for value_name in NIXL_PACKED_STAGING_MIB NIXL_PACKED_STAGING_SLOTS \
+  NIXL_PACKED_AUTO_RANGE_THRESHOLD NIXL_PACKED_AUTO_BLOCK_THRESHOLD; do
+  value=${!value_name}
+  if [[ ! "${value}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "${value_name} must be a positive integer" >&2
+    exit 1
+  fi
+done
+
 RUN_ID=$(date "+%Y%m%d-%H%M%S")
 RUN_ROOT="${RESULT_ROOT}/${RUN_ID}"
 mkdir -p "${RUN_ROOT}"
-printf '{"canonicalize_reverse_block_pairs":%s}\n' \
-  "${CANONICALIZE_REVERSE_BLOCK_PAIRS_JSON}" \
+printf '{"canonicalize_reverse_block_pairs":%s,"nixl_transfer_mode":"%s","nixl_packed_staging_mib":%s,"nixl_packed_staging_slots":%s,"nixl_packed_auto_range_threshold":%s,"nixl_packed_auto_block_threshold":%s}\n' \
+  "${CANONICALIZE_REVERSE_BLOCK_PAIRS_JSON}" "${NIXL_TRANSFER_MODE}" \
+  "${NIXL_PACKED_STAGING_MIB}" "${NIXL_PACKED_STAGING_SLOTS}" \
+  "${NIXL_PACKED_AUTO_RANGE_THRESHOLD}" \
+  "${NIXL_PACKED_AUTO_BLOCK_THRESHOLD}" \
   > "${RUN_ROOT}/experiment_config.json"
 
 PIDS=()
@@ -173,7 +198,7 @@ kv_config() {
   local role=$1
   local engine_id=$2
   cat <<EOF
-{"kv_connector":"NixlConnector","kv_role":"${role}","engine_id":"${engine_id}","kv_connector_extra_config":{"canonicalize_reverse_block_pairs":${CANONICALIZE_REVERSE_BLOCK_PAIRS_JSON}}}
+{"kv_connector":"NixlConnector","kv_role":"${role}","engine_id":"${engine_id}","kv_connector_extra_config":{"canonicalize_reverse_block_pairs":${CANONICALIZE_REVERSE_BLOCK_PAIRS_JSON},"nixl_transfer_mode":"${NIXL_TRANSFER_MODE}","nixl_packed_staging_mib":${NIXL_PACKED_STAGING_MIB},"nixl_packed_staging_slots":${NIXL_PACKED_STAGING_SLOTS},"nixl_packed_auto_range_threshold":${NIXL_PACKED_AUTO_RANGE_THRESHOLD},"nixl_packed_auto_block_threshold":${NIXL_PACKED_AUTO_BLOCK_THRESHOLD}}}
 EOF
 }
 
@@ -392,6 +417,10 @@ run_sleep_case() {
 
 echo "Results will be saved to ${RUN_ROOT}"
 echo "Paired-reverse block canonicalization: ${CANONICALIZE_REVERSE_BLOCK_PAIRS_JSON}"
+echo "NIXL transfer mode: ${NIXL_TRANSFER_MODE}"
+echo "Packed staging: ${NIXL_PACKED_STAGING_MIB} MiB x ${NIXL_PACKED_STAGING_SLOTS} slots"
+echo "Packed auto range threshold: ${NIXL_PACKED_AUTO_RANGE_THRESHOLD}"
+echo "Packed auto block threshold: ${NIXL_PACKED_AUTO_BLOCK_THRESHOLD}"
 while read -r sleep_ms; do
   [[ -z "${sleep_ms}" ]] && continue
   run_sleep_case "${sleep_ms}"

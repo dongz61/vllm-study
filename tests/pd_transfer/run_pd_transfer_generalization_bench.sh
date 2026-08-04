@@ -26,6 +26,11 @@ VARIANT_MODE=${VARIANT_MODE:-paired}
 # worker reports the remote KV as ready. Keep the default at zero so existing
 # OFF/ON generalization runs retain their original behavior.
 TRANSFER_DELAY_MS_LIST=${TRANSFER_DELAY_MS_LIST:-0}
+NIXL_TRANSFER_MODE=${NIXL_TRANSFER_MODE:-direct}
+NIXL_PACKED_STAGING_MIB=${NIXL_PACKED_STAGING_MIB:-64}
+NIXL_PACKED_STAGING_SLOTS=${NIXL_PACKED_STAGING_SLOTS:-2}
+NIXL_PACKED_AUTO_RANGE_THRESHOLD=${NIXL_PACKED_AUTO_RANGE_THRESHOLD:-16}
+NIXL_PACKED_AUTO_BLOCK_THRESHOLD=${NIXL_PACKED_AUTO_BLOCK_THRESHOLD:-32}
 
 require_value() {
   local name=$1
@@ -204,6 +209,19 @@ case "${VARIANT_MODE}" in
     exit 1
     ;;
 esac
+case "${NIXL_TRANSFER_MODE}" in
+  direct|packed|auto)
+    ;;
+  *)
+    echo "NIXL_TRANSFER_MODE must be direct, packed, or auto" >&2
+    exit 1
+    ;;
+esac
+for packed_integer_name in NIXL_PACKED_STAGING_MIB \
+  NIXL_PACKED_STAGING_SLOTS NIXL_PACKED_AUTO_RANGE_THRESHOLD \
+  NIXL_PACKED_AUTO_BLOCK_THRESHOLD; do
+  require_positive_integer "${packed_integer_name}"
+done
 
 read -r -a TRANSFER_DELAY_VALUES <<< "${TRANSFER_DELAY_MS_LIST}"
 if (( ${#TRANSFER_DELAY_VALUES[@]} == 0 )); then
@@ -361,7 +379,12 @@ python3 - \
   "${VARIANT_MODE}" \
   "${DIAGNOSTIC_RATE_VALUES[*]}" \
   "${TRANSFER_DELAY_VALUES[*]}" \
-  "${DIAGNOSTIC_TRANSFER_DELAY_VALUES[*]}" <<'PY'
+  "${DIAGNOSTIC_TRANSFER_DELAY_VALUES[*]}" \
+  "${NIXL_TRANSFER_MODE}" \
+  "${NIXL_PACKED_STAGING_MIB}" \
+  "${NIXL_PACKED_STAGING_SLOTS}" \
+  "${NIXL_PACKED_AUTO_RANGE_THRESHOLD}" \
+  "${NIXL_PACKED_AUTO_BLOCK_THRESHOLD}" <<'PY'
 import json
 import sys
 from datetime import datetime, timezone
@@ -371,7 +394,9 @@ from pathlib import Path
  dataset_source_format, dataset_loader, request_rates, num_prompts,
  repetitions, diagnostic_repetitions, max_concurrency, mooncake_block_size,
  mooncake_token_seed, variant_mode, diagnostic_request_rates,
- transfer_delay_ms, diagnostic_transfer_delay_ms) = sys.argv[1:]
+ transfer_delay_ms, diagnostic_transfer_delay_ms, nixl_transfer_mode,
+ packed_staging_mib, packed_staging_slots,
+ packed_auto_range_threshold, packed_auto_block_threshold) = sys.argv[1:]
 manifest = {
     "created_at": datetime.now(timezone.utc).isoformat(),
     "workload": workload_name,
@@ -410,6 +435,11 @@ manifest = {
     ),
     "server_configuration": "vllm-defaults-plus-required-pd-arguments",
     "variant_mode": variant_mode,
+    "nixl_transfer_mode": nixl_transfer_mode,
+    "nixl_packed_staging_mib": int(packed_staging_mib),
+    "nixl_packed_staging_slots": int(packed_staging_slots),
+    "nixl_packed_auto_range_threshold": int(packed_auto_range_threshold),
+    "nixl_packed_auto_block_threshold": int(packed_auto_block_threshold),
     "variant_order": (
         "odd repetitions: off,on; even repetitions: on,off"
         if variant_mode == "paired" else variant_mode
@@ -567,7 +597,7 @@ kv_config() {
   local enabled
   enabled=$(variant_json "${variant}")
   printf '%s\n' \
-    "{\"kv_connector\":\"NixlConnector\",\"kv_role\":\"${role}\",\"engine_id\":\"${engine_id}\",\"kv_connector_extra_config\":{\"canonicalize_reverse_block_pairs\":${enabled}}}"
+    "{\"kv_connector\":\"NixlConnector\",\"kv_role\":\"${role}\",\"engine_id\":\"${engine_id}\",\"kv_connector_extra_config\":{\"canonicalize_reverse_block_pairs\":${enabled},\"nixl_transfer_mode\":\"${NIXL_TRANSFER_MODE}\",\"nixl_packed_staging_mib\":${NIXL_PACKED_STAGING_MIB},\"nixl_packed_staging_slots\":${NIXL_PACKED_STAGING_SLOTS},\"nixl_packed_auto_range_threshold\":${NIXL_PACKED_AUTO_RANGE_THRESHOLD},\"nixl_packed_auto_block_threshold\":${NIXL_PACKED_AUTO_BLOCK_THRESHOLD}}}"
 }
 
 start_vllm_server() {
@@ -841,6 +871,10 @@ echo "Workload: ${WORKLOAD_NAME}, mixed input/output lengths"
 echo "Dataset loader: ${DATASET_LOADER}"
 echo "Dataset source format: ${DATASET_SOURCE_FORMAT}"
 echo "Variant mode: ${VARIANT_MODE}"
+echo "NIXL transfer mode: ${NIXL_TRANSFER_MODE}"
+echo "Packed staging: ${NIXL_PACKED_STAGING_MIB} MiB x ${NIXL_PACKED_STAGING_SLOTS} slots"
+echo "Packed auto range threshold: ${NIXL_PACKED_AUTO_RANGE_THRESHOLD}"
+echo "Packed auto block threshold: ${NIXL_PACKED_AUTO_BLOCK_THRESHOLD}"
 echo "Transfer delays (ms): ${TRANSFER_DELAY_VALUES[*]}"
 if [[ "${DATASET_LOADER}" == "mooncake" ]]; then
   echo "REQUEST_RATES are interpreted as recorded arrival-rate multipliers."

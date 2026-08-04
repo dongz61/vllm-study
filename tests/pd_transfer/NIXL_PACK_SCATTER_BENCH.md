@@ -215,3 +215,58 @@ byte of every unselected destination block retains its sentinel value.
 
 These constraints are intentional: the benchmark first determines whether a
 meaningful direct/packed crossover exists before production integration.
+
+## Experimental vLLM integration
+
+The NIXL connector can run the production pull path in three modes through
+`kv_connector_extra_config`:
+
+```json
+{
+  "kv_connector": "NixlConnector",
+  "kv_role": "kv_producer",
+  "engine_id": "example",
+  "kv_connector_extra_config": {
+    "nixl_transfer_mode": "direct",
+    "nixl_packed_staging_mib": 64,
+    "nixl_packed_staging_slots": 2,
+    "nixl_packed_auto_range_threshold": 16,
+    "nixl_packed_auto_block_threshold": 32
+  }
+}
+```
+
+Set `nixl_transfer_mode` to:
+
+- `direct` to preserve the original descriptor-based NIXL READ path. This is
+  the default.
+- `packed` to force every supported non-empty transfer through GPU gather,
+  contiguous READ, and GPU scatter.
+- `auto` to use the exact block count `B` and paired forward range count `K`.
+  It first selects packed when
+  `K >= nixl_packed_auto_range_threshold`; below that threshold it selects
+  packed only when `B <= nixl_packed_auto_block_threshold`.
+
+Use `kv_producer` on Prefill and `kv_consumer` on Decode, and supply the same
+packed configuration to both. The initial integration supports CUDA VRAM,
+separate producer/consumer instances, homogeneous TP, global attention, and
+uniform per-region block lengths. `kv_both` and unsupported layouts fall back
+to direct READ.
+
+Each staging slot is capped by `nixl_packed_staging_mib`; the connector rounds
+it down to an integral number of logical request blocks. Slots form a bounded
+ring shared by concurrent requests. Source packing is requested asynchronously
+over the existing NIXL ZMQ side channel, NIXL READ completion releases the
+remote slot, and the request is reported complete only after the destination
+scatter CUDA event completes.
+
+Staging is allocated after the KV cache. With the Qwen3-8B geometry used by the
+microbenchmark, two nominal 64 MiB slots consume about 126 MiB per GPU after
+integral-block rounding. Leave at least this much headroom in
+`--gpu-memory-utilization` for packed and auto runs.
+
+PD traces include `configured_transfer_mode`, `selected_transfer_path`, the
+selector's exact `selector_num_blocks` and `selector_forward_ranges`, packed
+chunk count, pack-control time, pack GPU time, and scatter GPU time. The auto
+thresholds are intentionally configurable because they come from two
+one-dimensional microbenchmark cuts and must be validated with end-to-end runs.

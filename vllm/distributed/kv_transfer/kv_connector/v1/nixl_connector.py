@@ -9,7 +9,7 @@ import queue
 import threading
 import time
 import uuid
-from collections import defaultdict
+from collections import defaultdict, deque
 from collections.abc import Iterator
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
@@ -49,6 +49,9 @@ EngineId = str
 ReqId = str
 
 GET_META_MSG = b"get_meta_msg"
+_PACK_CONTROL_VERSION = 1
+_PACK_COPY_TILE_BYTES = 4096
+_NIXL_TRANSFER_MODES = frozenset(("direct", "packed", "auto"))
 
 logger = init_logger(__name__)
 
@@ -89,6 +92,12 @@ class NixlAgentMetadata(
     block_lens: list[int]
     attn_backend_name: str
     kv_cache_layout: str
+    packed_staging_base_addr: int = 0
+    packed_staging_slot_bytes: int = 0
+    packed_staging_slots: int = 0
+    packed_blocks_per_slot: int = 0
+    packed_block_bytes: int = 0
+    packed_num_regions: int = 0
 
 
 @dataclass
@@ -99,6 +108,135 @@ class ReqMeta:
     remote_port: int
     remote_engine_id: str
     tp_size: int
+
+
+@dataclass
+class _PackedChunkState:
+    key: str
+    request_id: str
+    chunk_id: int
+    local_block_ids: list[int]
+    remote_block_ids: list[int]
+    local_slot: Optional[int] = None
+    remote_slot: Optional[int] = None
+    status: str = "queued"
+    handle: Optional[int] = None
+    pack_request_ns: Optional[int] = None
+    scatter_start_event: Optional[torch.cuda.Event] = None
+    scatter_event: Optional[torch.cuda.Event] = None
+    retry_at: float = 0.0
+
+
+@dataclass
+class _PackedRequestState:
+    request_id: str
+    dst_engine_id: str
+    remote_host: str
+    remote_port: int
+    remote_tp_size: int
+    notif_id: bytes
+    chunks: list[_PackedChunkState]
+    read_chunks_done: int = 0
+    scatter_chunks_done: int = 0
+    notification_sent: bool = False
+
+
+def _should_use_packed_path(mode: str, num_blocks: int, forward_ranges: int,
+                            auto_range_threshold: int,
+                            auto_block_threshold: int) -> bool:
+    """Select the experimental transfer path from exact request geometry."""
+    if mode not in _NIXL_TRANSFER_MODES:
+        raise ValueError(f"unsupported NIXL transfer mode: {mode}")
+    if mode == "direct" or num_blocks <= 0:
+        return False
+    if mode == "packed":
+        return True
+    if forward_ranges >= auto_range_threshold:
+        return True
+    return num_blocks <= auto_block_threshold
+
+
+_PACK_TRITON_KERNELS: Optional[tuple[Any, Any, Any]] = None
+
+
+def _get_pack_triton_kernels() -> tuple[Any, Any, Any]:
+    """Define pack/scatter kernels lazily for CPU-only imports and tests."""
+    global _PACK_TRITON_KERNELS
+    if _PACK_TRITON_KERNELS is not None:
+        return _PACK_TRITON_KERNELS
+
+    import triton
+    import triton.language as tl
+
+    @triton.jit
+    def pack_regions_kernel(region_ptrs, block_ids, staging,
+                            request_block_count, block_bytes,
+                            COPY_TILE: tl.constexpr):
+        row_id = tl.program_id(0)
+        tile_id = tl.program_id(1)
+        region_id = row_id // request_block_count
+        request_block_id = row_id % request_block_count
+        region_ptr = tl.load(region_ptrs + region_id).to(staging.dtype)
+        physical_block_id = tl.load(block_ids + request_block_id)
+        offsets = tile_id * COPY_TILE + tl.arange(0, COPY_TILE)
+        mask = offsets < block_bytes
+        source_offsets = (
+            physical_block_id.to(tl.int64) * block_bytes.to(tl.int64) +
+            offsets)
+        destination_offsets = (row_id.to(tl.int64) * block_bytes.to(tl.int64) +
+                               offsets)
+        values = tl.load(region_ptr + source_offsets, mask=mask)
+        tl.store(staging + destination_offsets, values, mask=mask)
+
+    @triton.jit
+    def scatter_regions_kernel(region_ptrs, block_ids, staging,
+                               request_block_count, block_bytes,
+                               COPY_TILE: tl.constexpr):
+        row_id = tl.program_id(0)
+        tile_id = tl.program_id(1)
+        region_id = row_id // request_block_count
+        request_block_id = row_id % request_block_count
+        region_ptr = tl.load(region_ptrs + region_id).to(staging.dtype)
+        offsets = tile_id * COPY_TILE + tl.arange(0, COPY_TILE)
+        mask = offsets < block_bytes
+        source_offsets = (row_id.to(tl.int64) * block_bytes.to(tl.int64) +
+                          offsets)
+        physical_block_id = tl.load(block_ids + request_block_id)
+        destination_offsets = (
+            physical_block_id.to(tl.int64) * block_bytes.to(tl.int64) +
+            offsets)
+        values = tl.load(staging + source_offsets, mask=mask)
+        tl.store(region_ptr + destination_offsets, values, mask=mask)
+
+    _PACK_TRITON_KERNELS = (triton, pack_regions_kernel,
+                            scatter_regions_kernel)
+    return _PACK_TRITON_KERNELS
+
+
+def _launch_pack_regions(region_ptrs: torch.Tensor, block_ids: torch.Tensor,
+                         staging: torch.Tensor, block_bytes: int) -> None:
+    triton, pack_kernel, _ = _get_pack_triton_kernels()
+    grid = (region_ptrs.numel() * block_ids.numel(),
+            triton.cdiv(block_bytes, _PACK_COPY_TILE_BYTES))
+    pack_kernel[grid](region_ptrs,
+                      block_ids,
+                      staging,
+                      block_ids.numel(),
+                      block_bytes,
+                      COPY_TILE=_PACK_COPY_TILE_BYTES)
+
+
+def _launch_scatter_regions(region_ptrs: torch.Tensor, block_ids: torch.Tensor,
+                            staging: torch.Tensor, block_bytes: int) -> None:
+    triton, _, scatter_kernel = _get_pack_triton_kernels()
+    grid = (region_ptrs.numel() * block_ids.numel(),
+            triton.cdiv(block_bytes, _PACK_COPY_TILE_BYTES))
+    scatter_kernel[grid](region_ptrs,
+                         block_ids,
+                         staging,
+                         block_ids.numel(),
+                         block_bytes,
+                         COPY_TILE=_PACK_COPY_TILE_BYTES)
 
 
 @dataclass(frozen=True)
@@ -363,6 +501,16 @@ class _NixlTransferTraceState:
     canonicalized_reverse_run_count: int = 0
     canonicalized_reverse_block_count: int = 0
     transfer_skipped: bool = False
+    configured_transfer_mode: str = "direct"
+    selected_transfer_path: str = "direct"
+    selector_num_blocks: int = 0
+    selector_forward_ranges: int = 0
+    auto_range_threshold: int = 16
+    auto_block_threshold: int = 32
+    packed_chunk_count: int = 0
+    packed_pack_control_total_ns: int = 0
+    packed_pack_gpu_total_ns: int = 0
+    packed_scatter_gpu_total_ns: int = 0
 
 
 class NixlConnectorMetadata(KVConnectorMetadata):
@@ -750,6 +898,39 @@ class NixlConnectorWorker:
         self.vllm_config = vllm_config
         self.block_size = vllm_config.cache_config.block_size
         self._pd_transfer_sleep_ms = self._get_pd_transfer_sleep_ms()
+        transfer_mode = vllm_config.kv_transfer_config.get_from_extra_config(
+            "nixl_transfer_mode", "direct")
+        if not isinstance(transfer_mode, str):
+            raise ValueError("nixl_transfer_mode must be a string")
+        transfer_mode = transfer_mode.lower()
+        if transfer_mode not in _NIXL_TRANSFER_MODES:
+            raise ValueError(
+                "nixl_transfer_mode must be one of direct, packed, "
+                "or auto")
+        self._nixl_transfer_mode = transfer_mode
+
+        def positive_int_config(name: str, default: int) -> int:
+            value = vllm_config.kv_transfer_config.get_from_extra_config(
+                name, default)
+            if isinstance(value,
+                          bool) or not isinstance(value, int) or value <= 0:
+                raise ValueError(f"{name} must be a positive integer")
+            return value
+
+        self._packed_staging_mib = positive_int_config(
+            "nixl_packed_staging_mib", 64)
+        self._packed_staging_slots = positive_int_config(
+            "nixl_packed_staging_slots", 2)
+        self._packed_auto_range_threshold = positive_int_config(
+            "nixl_packed_auto_range_threshold", 16)
+        self._packed_auto_block_threshold = positive_int_config(
+            "nixl_packed_auto_block_threshold", 32)
+        logger.info(
+            "NIXL transfer mode=%s, packed staging=%s MiB x %s slots, "
+            "auto range threshold=%s, auto block threshold=%s",
+            self._nixl_transfer_mode, self._packed_staging_mib,
+            self._packed_staging_slots, self._packed_auto_range_threshold,
+            self._packed_auto_block_threshold)
         canonicalize_reverse_block_pairs = (
             vllm_config.kv_transfer_config.get_from_extra_config(
                 "canonicalize_reverse_block_pairs", False))
@@ -845,6 +1026,29 @@ class NixlConnectorWorker:
         self.dst_num_blocks: dict[EngineId, int] = {}
         self._registered_descs: list[Any] = []
 
+        # Experimental GPU pack/READ/scatter resources. They are initialized
+        # after the KV cache layout is known in register_kv_caches().
+        self._packed_available = False
+        self._packed_staging: Optional[torch.Tensor] = None
+        self._packed_region_ptrs: Optional[torch.Tensor] = None
+        self._packed_block_bytes = 0
+        self._packed_slot_bytes = 0
+        self._packed_blocks_per_slot = 0
+        self._packed_src_xfer_side_handle = 0
+        self._packed_dst_xfer_side_handles: dict[EngineId, int] = {}
+        self._packed_remote_blocks_per_slot: dict[EngineId, int] = {}
+        self._packed_pack_stream: Optional[torch.cuda.Stream] = None
+        self._packed_scatter_stream: Optional[torch.cuda.Stream] = None
+        self._packed_source_free_slots: deque[int] = deque()
+        self._packed_source_slots: dict[str, int] = {}
+        self._packed_local_free_slots: deque[int] = deque()
+        self._packed_requests: dict[ReqId, _PackedRequestState] = {}
+        self._packed_chunks_by_key: dict[str, _PackedChunkState] = {}
+        self._packed_control_context: Optional[zmq.Context] = None
+        self._packed_control_sockets: dict[EngineId, zmq.Socket] = {}
+        self._packed_control_endpoints: dict[EngineId, tuple[str, int,
+                                                             int]] = {}
+
         # In progress transfers.
         # [req_id -> list[handle]]
         self._recving_metadata: dict[ReqId, ReqMeta] = {}
@@ -906,13 +1110,16 @@ class NixlConnectorWorker:
 
     @staticmethod
     def _nixl_handshake_listener(metadata: NixlAgentMetadata,
-                                 ready_event: threading.Event, base_port: int,
-                                 tp_rank: int):
-        """Background thread for getting new NIXL handshakes."""
+                                 ready_event: threading.Event,
+                                 base_port: int,
+                                 tp_rank: int,
+                                 packed_control_handler: Optional[Any] = None):
+        """Serve metadata handshakes and experimental pack control messages."""
         # NOTE(rob): this is a simple implementation. We will move
         # to a better approach via HTTP endpoint soon.
 
         encoder = msgspec.msgpack.Encoder()
+        decoder = msgspec.msgpack.Decoder()
         encoded_data = encoder.encode(metadata)
         size_in_bytes = len(encoded_data)
         logger.debug("Size of encoded NixlAgentMetadata: %s bytes",
@@ -925,11 +1132,34 @@ class NixlConnectorWorker:
         with zmq_ctx(zmq.ROUTER, path) as sock:
             ready_event.set()
             while True:
-                identity, _, msg = sock.recv_multipart()
-                if msg != GET_META_MSG:
-                    logger.warning(
-                        "Connection listener got unexpected message %s", msg)
-                sock.send_multipart((identity, b"", encoded_data))
+                frames = sock.recv_multipart()
+                identity = frames[0]
+                has_req_delimiter = len(frames) >= 3 and frames[-2] == b""
+                msg = frames[-1]
+                if msg == GET_META_MSG:
+                    response = encoded_data
+                else:
+                    try:
+                        request = decoder.decode(msg)
+                        if (packed_control_handler is None
+                                or not isinstance(request, dict)):
+                            raise RuntimeError(
+                                "packed transfer control is unavailable")
+                        reply = packed_control_handler(request)
+                        if reply is None:
+                            continue
+                        response = encoder.encode(reply)
+                    except BaseException as exc:
+                        logger.exception("NIXL packed control request failed")
+                        response = encoder.encode({
+                            "version": _PACK_CONTROL_VERSION,
+                            "type": "error",
+                            "error": str(exc),
+                        })
+                if has_req_delimiter:
+                    sock.send_multipart((identity, b"", response))
+                else:
+                    sock.send_multipart((identity, response))
 
     def _nixl_handshake(
         self,
@@ -1004,6 +1234,213 @@ class NixlConnectorWorker:
         """Assign copy (d2h, h2d) operations when host buffer is used."""
         assert self.use_host_buffer
         self.copy_blocks = copy_operation
+
+    def _initialize_packed_staging(self) -> None:
+        """Allocate and register a bounded GPU staging ring."""
+        if self._nixl_transfer_mode == "direct":
+            return
+
+        unsupported_reason: Optional[str] = None
+        if self.vllm_config.kv_transfer_config.kv_role == "kv_both":
+            unsupported_reason = "the initial staging pool does not support kv_both"
+        elif self.device_type != "cuda" or self.use_host_buffer:
+            unsupported_reason = "only CUDA VRAM buffers are supported"
+        elif self.use_mla or self._use_flashinfer or self._use_pallas:
+            unsupported_reason = "MLA, FlashInfer, and Pallas are not supported"
+        elif self.block_window_per_layer:
+            unsupported_reason = "hybrid/local attention is not supported"
+        elif not self.block_len_per_layer or len(set(
+                self.block_len_per_layer)) != 1:
+            unsupported_reason = "all registered regions must use one block size"
+        elif len(self.kv_caches_base_addr[self.engine_id]) != self.num_regions:
+            unsupported_reason = "registered region pointers do not match regions"
+
+        if unsupported_reason is not None:
+            logger.warning("NIXL packed path disabled: %s; using direct READ",
+                           unsupported_reason)
+            return
+
+        # Import/define the kernels now so missing Triton dependencies are
+        # reported at startup rather than on the first request.
+        try:
+            _get_pack_triton_kernels()
+        except (ImportError, ModuleNotFoundError) as exc:
+            logger.warning(
+                "NIXL packed path disabled because Triton is "
+                "unavailable: %s", exc)
+            return
+
+        self._packed_block_bytes = self.block_len_per_layer[0]
+        request_block_bytes = self.num_regions * self._packed_block_bytes
+        configured_slot_bytes = self._packed_staging_mib * 1024 * 1024
+        self._packed_blocks_per_slot = configured_slot_bytes // request_block_bytes
+        if self._packed_blocks_per_slot == 0:
+            logger.warning(
+                "NIXL packed path disabled: %s MiB staging cannot hold one "
+                "%s-byte logical request block", self._packed_staging_mib,
+                request_block_bytes)
+            return
+        self._packed_slot_bytes = (self._packed_blocks_per_slot *
+                                   request_block_bytes)
+
+        first_cache_or_caches = next(iter(self.device_kv_caches.values()))
+        first_cache = (first_cache_or_caches[0] if isinstance(
+            first_cache_or_caches, (list, tuple)) else first_cache_or_caches)
+        device = first_cache.device
+        total_bytes = self._packed_staging_slots * self._packed_slot_bytes
+        self._packed_staging = torch.empty(total_bytes,
+                                           dtype=torch.uint8,
+                                           device=device)
+        self._packed_region_ptrs = torch.tensor(
+            self.kv_caches_base_addr[self.engine_id],
+            dtype=torch.int64,
+            device=device)
+        self._packed_pack_stream = torch.cuda.Stream(device=device)
+        self._packed_scatter_stream = torch.cuda.Stream(device=device)
+
+        registration = self.nixl_wrapper.get_reg_descs(
+            [(self._packed_staging.data_ptr(), total_bytes, self.tp_rank, "")],
+            self.nixl_memory_type)
+        self.nixl_wrapper.register_memory(registration,
+                                          backends=self.nixl_backends)
+        self._registered_descs.append(registration)
+
+        staging_data = []
+        base_addr = self._packed_staging.data_ptr()
+        for slot in range(self._packed_staging_slots):
+            slot_addr = base_addr + slot * self._packed_slot_bytes
+            for count in range(1, self._packed_blocks_per_slot + 1):
+                staging_data.append(
+                    (slot_addr, count * request_block_bytes, self.tp_rank))
+        descs = self.nixl_wrapper.get_xfer_descs(staging_data,
+                                                 self.nixl_memory_type)
+        self._packed_src_xfer_side_handle = (self.nixl_wrapper.prep_xfer_dlist(
+            "NIXL_INIT_AGENT", descs))
+        self._packed_source_free_slots = deque(
+            range(self._packed_staging_slots))
+        self._packed_local_free_slots = deque(range(
+            self._packed_staging_slots))
+        self._packed_available = True
+        logger.info(
+            "NIXL packed staging ready: %s slots, %.2f MiB/slot, "
+            "%s request blocks/slot, %s regions x %s bytes",
+            self._packed_staging_slots,
+            self._packed_slot_bytes / (1024 * 1024),
+            self._packed_blocks_per_slot, self.num_regions,
+            self._packed_block_bytes)
+
+    def _handle_packed_control(
+            self, request: dict[str, Any]) -> Optional[dict[str, Any]]:
+        """Run in the side-channel thread on the source/Prefill worker."""
+        if request.get("version") != _PACK_CONTROL_VERSION:
+            raise ValueError("unsupported packed control protocol version")
+        message_type = request.get("type")
+        key = request.get("key")
+        if not isinstance(key, str):
+            raise ValueError("packed control message is missing its key")
+
+        if message_type == "release":
+            slot = self._packed_source_slots.pop(key, None)
+            if slot is not None:
+                self._packed_source_free_slots.append(slot)
+            return None
+        if message_type != "pack":
+            raise ValueError(f"unknown packed control message: {message_type}")
+        if not self._packed_available:
+            return {
+                "version": _PACK_CONTROL_VERSION,
+                "type": "unavailable",
+                "key": key,
+            }
+        if key in self._packed_source_slots:
+            return {
+                "version": _PACK_CONTROL_VERSION,
+                "type": "ready",
+                "key": key,
+                "remote_slot": self._packed_source_slots[key],
+                "block_count": len(request.get("block_ids", [])),
+                "pack_gpu_ns": 0,
+            }
+        if not self._packed_source_free_slots:
+            return {
+                "version": _PACK_CONTROL_VERSION,
+                "type": "busy",
+                "key": key,
+            }
+
+        block_ids = request.get("block_ids")
+        if (not isinstance(block_ids, list) or not block_ids
+                or len(block_ids) > self._packed_blocks_per_slot
+                or any(not isinstance(block_id, int) or block_id < 0
+                       or block_id >= self.num_blocks
+                       for block_id in block_ids)):
+            raise ValueError("invalid packed source block IDs")
+
+        slot = self._packed_source_free_slots.popleft()
+        self._packed_source_slots[key] = slot
+        try:
+            assert self._packed_staging is not None
+            assert self._packed_region_ptrs is not None
+            assert self._packed_pack_stream is not None
+            staging = self._packed_staging.narrow(
+                0, slot * self._packed_slot_bytes, self._packed_slot_bytes)
+            device = self._packed_staging.device
+            start_event = torch.cuda.Event(enable_timing=True)
+            end_event = torch.cuda.Event(enable_timing=True)
+            self._packed_pack_stream.wait_stream(
+                torch.cuda.default_stream(device))
+            with torch.cuda.device(device), torch.cuda.stream(
+                    self._packed_pack_stream):
+                ids = torch.tensor(block_ids, dtype=torch.int64, device=device)
+                start_event.record(self._packed_pack_stream)
+                _launch_pack_regions(self._packed_region_ptrs, ids, staging,
+                                     self._packed_block_bytes)
+                end_event.record(self._packed_pack_stream)
+            end_event.synchronize()
+            pack_gpu_ns = int(start_event.elapsed_time(end_event) * 1_000_000)
+        except BaseException:
+            self._packed_source_slots.pop(key, None)
+            self._packed_source_free_slots.appendleft(slot)
+            raise
+
+        return {
+            "version": _PACK_CONTROL_VERSION,
+            "type": "ready",
+            "key": key,
+            "remote_slot": slot,
+            "block_count": len(block_ids),
+            "pack_gpu_ns": pack_gpu_ns,
+        }
+
+    def _get_packed_control_socket(self,
+                                   state: _PackedRequestState) -> zmq.Socket:
+        socket = self._packed_control_sockets.get(state.dst_engine_id)
+        tp_ratio = self._tp_size[self.engine_id] // state.remote_tp_size
+        remote_rank = self.tp_rank // tp_ratio
+        endpoint = (state.remote_host, state.remote_port, remote_rank)
+        if socket is not None:
+            if self._packed_control_endpoints[state.dst_engine_id] != endpoint:
+                raise RuntimeError(
+                    "packed control endpoint changed for engine")
+            return socket
+
+        if self._packed_control_context is None:
+            self._packed_control_context = zmq.Context(
+            )  # type: ignore[attr-defined]
+        path = make_zmq_path("tcp", state.remote_host,
+                             state.remote_port + remote_rank)
+        socket = self._packed_control_context.socket(zmq.DEALER)
+        socket.setsockopt(zmq.LINGER, 0)
+        socket.connect(path)
+        self._packed_control_sockets[state.dst_engine_id] = socket
+        self._packed_control_endpoints[state.dst_engine_id] = endpoint
+        return socket
+
+    def _send_packed_control(self, state: _PackedRequestState,
+                             message: dict[str, Any]) -> None:
+        message["version"] = _PACK_CONTROL_VERSION
+        self._get_packed_control_socket(state).send(
+            msgspec.msgpack.encode(message))
 
     def _background_nixl_handshake(self, req_id: str,
                                    remote_engine_id: EngineId, meta: ReqMeta):
@@ -1189,6 +1626,8 @@ class NixlConnectorWorker:
                          self.block_window_per_layer)
             assert len(self.block_window_per_layer) == self.num_layers
 
+        self._initialize_packed_staging()
+
         # After KV Caches registered, listen for new connections.
         metadata = NixlAgentMetadata(
             engine_id=self.engine_id,
@@ -1197,11 +1636,25 @@ class NixlConnectorWorker:
             num_blocks=self.num_blocks,
             block_lens=self.block_len_per_layer,
             attn_backend_name=self.backend_name,
-            kv_cache_layout=self.kv_cache_layout)
+            kv_cache_layout=self.kv_cache_layout,
+            packed_staging_base_addr=(
+                self._packed_staging.data_ptr() if self._packed_available
+                and self._packed_staging is not None else 0),
+            packed_staging_slot_bytes=(self._packed_slot_bytes
+                                       if self._packed_available else 0),
+            packed_staging_slots=(self._packed_staging_slots
+                                  if self._packed_available else 0),
+            packed_blocks_per_slot=(self._packed_blocks_per_slot
+                                    if self._packed_available else 0),
+            packed_block_bytes=(self._packed_block_bytes
+                                if self._packed_available else 0),
+            packed_num_regions=(self.num_regions
+                                if self._packed_available else 0))
         ready_event = threading.Event()
         self._nixl_handshake_listener_t = threading.Thread(
             target=self._nixl_handshake_listener,
-            args=(metadata, ready_event, self.side_channel_port, self.tp_rank),
+            args=(metadata, ready_event, self.side_channel_port, self.tp_rank,
+                  self._handle_packed_control),
             daemon=True,
             name="nixl_handshake_listener")
         self._nixl_handshake_listener_t.start()
@@ -1359,6 +1812,37 @@ class NixlConnectorWorker:
             engine_id] = self.nixl_wrapper.prep_xfer_dlist(
                 remote_agent_name, descs)
 
+        # The packed path is intentionally enabled only when both peers expose
+        # an identical homogeneous staging layout. Direct READ remains the
+        # compatibility fallback for mixed versions or unsupported backends.
+        if (self._packed_available and nixl_agent_meta.packed_staging_base_addr
+                and nixl_agent_meta.packed_staging_slots > 0
+                and nixl_agent_meta.packed_blocks_per_slot > 0
+                and nixl_agent_meta.packed_num_regions == self.num_regions and
+                nixl_agent_meta.packed_block_bytes == self._packed_block_bytes
+                and tp_ratio == 1):
+            request_block_bytes = self.num_regions * self._packed_block_bytes
+            remote_staging_data = []
+            for slot in range(nixl_agent_meta.packed_staging_slots):
+                slot_addr = (nixl_agent_meta.packed_staging_base_addr +
+                             slot * nixl_agent_meta.packed_staging_slot_bytes)
+                for count in range(1,
+                                   nixl_agent_meta.packed_blocks_per_slot + 1):
+                    remote_staging_data.append(
+                        (slot_addr, count * request_block_bytes,
+                         remote_tp_rank))
+            packed_descs = self.nixl_wrapper.get_xfer_descs(
+                remote_staging_data, self.nixl_memory_type)
+            self._packed_dst_xfer_side_handles[engine_id] = (
+                self.nixl_wrapper.prep_xfer_dlist(remote_agent_name,
+                                                  packed_descs))
+            self._packed_remote_blocks_per_slot[engine_id] = (
+                nixl_agent_meta.packed_blocks_per_slot)
+        elif self._nixl_transfer_mode != "direct":
+            logger.warning_once(
+                "Remote NIXL engine %s does not expose a compatible packed "
+                "staging pool; requests will use direct READ", engine_id)
+
         return remote_agent_name
 
     def sync_recved_kv_to_device(self, req_id: str, meta: ReqMeta):
@@ -1403,6 +1887,11 @@ class NixlConnectorWorker:
                         num_local_blocks=0,
                         num_remote_blocks=0,
                         kv_load_start_ns=now_ns,
+                        configured_transfer_mode=self._nixl_transfer_mode,
+                        auto_range_threshold=(
+                            self._packed_auto_range_threshold),
+                        auto_block_threshold=(
+                            self._packed_auto_block_threshold),
                         reverse_block_pair_canonicalization_enabled=(
                             self._canonicalize_reverse_block_pairs),
                     )
@@ -1463,7 +1952,8 @@ class NixlConnectorWorker:
             block_pair_stats: Optional[_BlockPairStats] = None,
             block_pair_stats_ns: int = 0,
             canonicalized_reverse_run_count: int = 0,
-            canonicalized_reverse_block_count: int = 0) -> None:
+            canonicalized_reverse_block_count: int = 0,
+            num_handles: int = 1) -> None:
         if not self._pd_trace_enabled:
             return
         with self._transfer_trace_lock:
@@ -1475,7 +1965,7 @@ class NixlConnectorWorker:
             state.num_local_descs += num_local_descs
             state.num_remote_descs += num_remote_descs
             state.total_bytes += total_bytes
-            state.num_handles += 1
+            state.num_handles += num_handles
             state.canonicalized_reverse_run_count += (
                 canonicalized_reverse_run_count)
             state.canonicalized_reverse_block_count += (
@@ -1605,6 +2095,19 @@ class NixlConnectorWorker:
             role="decode",
             tp_rank=self.tp_rank,
             remote_engine_id=state.remote_engine_id,
+            configured_transfer_mode=state.configured_transfer_mode,
+            selected_transfer_path=state.selected_transfer_path,
+            selector_num_blocks=state.selector_num_blocks,
+            selector_forward_ranges=state.selector_forward_ranges,
+            auto_range_threshold=state.auto_range_threshold,
+            auto_block_threshold=state.auto_block_threshold,
+            packed_chunk_count=state.packed_chunk_count,
+            packed_pack_control_ms=round(
+                state.packed_pack_control_total_ns / 1_000_000, 6),
+            packed_pack_gpu_ms=round(
+                state.packed_pack_gpu_total_ns / 1_000_000, 6),
+            packed_scatter_gpu_ms=round(
+                state.packed_scatter_gpu_total_ns / 1_000_000, 6),
             handshake_cached=state.handshake_cached,
             num_local_blocks=state.num_local_blocks,
             num_remote_blocks=state.num_remote_blocks,
@@ -1690,6 +2193,7 @@ class NixlConnectorWorker:
         """
         done_sending = self._get_new_notifs()
         done_recving = self._pop_done_transfers(self._recving_transfers)
+        done_recving.update(self._poll_packed_transfers())
         if len(done_sending) > 0 or len(done_recving) > 0:
             logger.debug(
                 "Rank %s, get_finished: %s requests done sending "
@@ -1912,20 +2416,306 @@ class NixlConnectorWorker:
             dst_engine_id=meta.remote_engine_id,
             local_block_ids=meta.local_block_ids,
             remote_block_ids=meta.remote_block_ids,
+            remote_host=meta.remote_host,
+            remote_port=meta.remote_port,
+            remote_tp_size=meta.tp_size,
         )
 
-    def _read_blocks(self, local_block_ids: list[int],
-                     remote_block_ids: list[int], dst_engine_id: str,
-                     request_id: str):
-        # NOTE(rob): having the staging blocks be on the READER side is
-        # not going to work well (since we will have to call rearrange tensors).
-        # after we detect the txn is complete (which means we cannot make the
-        # read trxn async easily). If we want to make "READ" happen cleanly,
-        # then we will need to have the staging blocks on the remote side.
+    def _start_packed_transfer(self, request_id: str, dst_engine_id: str,
+                               local_block_ids: list[int],
+                               remote_block_ids: list[int], remote_host: str,
+                               remote_port: int, remote_tp_size: int,
+                               notif_id: bytes,
+                               block_pair_stats: Optional[_BlockPairStats],
+                               block_pair_stats_ns: int,
+                               canonicalized_reverse_run_count: int,
+                               canonicalized_reverse_block_count: int) -> None:
+        remote_blocks_per_slot = self._packed_remote_blocks_per_slot[
+            dst_engine_id]
+        blocks_per_chunk = min(self._packed_blocks_per_slot,
+                               remote_blocks_per_slot)
+        chunks: list[_PackedChunkState] = []
+        nonce = uuid.uuid4().hex
+        for chunk_id, start in enumerate(
+                range(0, len(local_block_ids), blocks_per_chunk)):
+            end = min(start + blocks_per_chunk, len(local_block_ids))
+            key = f"{self.engine_id}/{request_id}/{nonce}/{chunk_id}"
+            chunk = _PackedChunkState(
+                key=key,
+                request_id=request_id,
+                chunk_id=chunk_id,
+                local_block_ids=local_block_ids[start:end],
+                remote_block_ids=remote_block_ids[start:end])
+            chunks.append(chunk)
+            self._packed_chunks_by_key[key] = chunk
 
-        # NOTE(rob): according to nvidia the staging blocks are used to
-        # saturate IB with heterogeneous TP sizes. We should remove the staging
-        # blocks until we are ready.
+        state = _PackedRequestState(request_id=request_id,
+                                    dst_engine_id=dst_engine_id,
+                                    remote_host=remote_host,
+                                    remote_port=remote_port,
+                                    remote_tp_size=remote_tp_size,
+                                    notif_id=notif_id,
+                                    chunks=chunks)
+        self._packed_requests[request_id] = state
+        self._record_transfer_shape(
+            request_id,
+            num_local_blocks=len(local_block_ids),
+            num_remote_blocks=len(remote_block_ids),
+            num_local_descs=len(chunks),
+            num_remote_descs=len(chunks),
+            total_bytes=self._get_transfer_nbytes(local_block_ids),
+            block_pair_stats=block_pair_stats,
+            block_pair_stats_ns=block_pair_stats_ns,
+            canonicalized_reverse_run_count=(canonicalized_reverse_run_count),
+            canonicalized_reverse_block_count=(
+                canonicalized_reverse_block_count),
+            num_handles=len(chunks))
+        if self._pd_trace_enabled:
+            with self._transfer_trace_lock:
+                trace_state = self._transfer_trace_states.get(request_id)
+                if trace_state is not None:
+                    trace_state.packed_chunk_count = len(chunks)
+        trace_event("pull_transfer_start",
+                    request_id,
+                    role="decode",
+                    remote_engine_id=dst_engine_id,
+                    transfer_path="packed",
+                    num_local_blocks=len(local_block_ids),
+                    num_remote_blocks=len(remote_block_ids),
+                    num_chunks=len(chunks),
+                    num_local_descs=len(chunks),
+                    num_remote_descs=len(chunks))
+        self._schedule_packed_chunks()
+
+    def _schedule_packed_chunks(self) -> None:
+        """Reserve local slots and asynchronously request source-side packs."""
+        now = time.perf_counter()
+        for state in self._packed_requests.values():
+            for chunk in state.chunks:
+                if chunk.status not in ("queued", "retry"):
+                    continue
+                if chunk.status == "retry" and now < chunk.retry_at:
+                    continue
+                if chunk.local_slot is None:
+                    if not self._packed_local_free_slots:
+                        return
+                    chunk.local_slot = self._packed_local_free_slots.popleft()
+                self._send_packed_control(
+                    state, {
+                        "type": "pack",
+                        "key": chunk.key,
+                        "request_id": chunk.request_id,
+                        "chunk_id": chunk.chunk_id,
+                        "block_ids": chunk.remote_block_ids,
+                    })
+                chunk.pack_request_ns = time.perf_counter_ns()
+                chunk.status = "pack_requested"
+
+    def _start_packed_read(self, state: _PackedRequestState,
+                           chunk: _PackedChunkState, remote_slot: int) -> None:
+        assert chunk.local_slot is not None
+        block_count = len(chunk.local_block_ids)
+        local_index = (chunk.local_slot * self._packed_blocks_per_slot +
+                       block_count - 1)
+        remote_blocks_per_slot = self._packed_remote_blocks_per_slot[
+            state.dst_engine_id]
+        remote_index = remote_slot * remote_blocks_per_slot + block_count - 1
+        local_indices = np.asarray([local_index], dtype=np.int32)
+        remote_indices = np.asarray([remote_index], dtype=np.int32)
+        prepare_start_ns = time.perf_counter_ns()
+        handle = self.nixl_wrapper.make_prepped_xfer(
+            "READ", self._packed_src_xfer_side_handle, local_indices,
+            self._packed_dst_xfer_side_handles[state.dst_engine_id],
+            remote_indices)
+        self._record_trace_phase(request_id=state.request_id,
+                                 phase="xfer_prepare",
+                                 start_ns=prepare_start_ns,
+                                 end_ns=time.perf_counter_ns())
+        submit_start_ns = time.perf_counter_ns()
+        self.nixl_wrapper.transfer(handle)
+        self._record_trace_phase(request_id=state.request_id,
+                                 phase="xfer_submit",
+                                 start_ns=submit_start_ns,
+                                 end_ns=time.perf_counter_ns())
+        chunk.remote_slot = remote_slot
+        chunk.handle = handle
+        chunk.status = "reading"
+
+    def _poll_packed_control_responses(self) -> None:
+        decoder = msgspec.msgpack.Decoder()
+        for socket in self._packed_control_sockets.values():
+            while socket.poll(timeout=0, flags=zmq.POLLIN):
+                response = decoder.decode(socket.recv())
+                if not isinstance(response, dict):
+                    raise RuntimeError("invalid packed control response")
+                response_type = response.get("type")
+                key = response.get("key")
+                if response_type == "error":
+                    raise RuntimeError("remote packed control failed: " +
+                                       str(response.get("error")))
+                if not isinstance(
+                        key, str) or key not in self._packed_chunks_by_key:
+                    logger.warning("Ignoring stale packed response for key %s",
+                                   key)
+                    continue
+                chunk = self._packed_chunks_by_key[key]
+                state = self._packed_requests[chunk.request_id]
+                if response_type == "busy":
+                    chunk.status = "retry"
+                    chunk.retry_at = time.perf_counter() + 0.001
+                    continue
+                if response_type == "unavailable":
+                    raise RuntimeError(
+                        "remote packed staging became unavailable")
+                if response_type != "ready":
+                    raise RuntimeError(
+                        f"unexpected packed control response: {response_type}")
+                if response.get("block_count") != len(chunk.local_block_ids):
+                    raise RuntimeError("packed control block count mismatch")
+                if self._pd_trace_enabled:
+                    ready_ns = time.perf_counter_ns()
+                    with self._transfer_trace_lock:
+                        trace_state = self._transfer_trace_states.get(
+                            chunk.request_id)
+                        if trace_state is not None:
+                            if chunk.pack_request_ns is not None:
+                                trace_state.packed_pack_control_total_ns += (
+                                    ready_ns - chunk.pack_request_ns)
+                            pack_gpu_ns = response.get("pack_gpu_ns", 0)
+                            if isinstance(pack_gpu_ns, int):
+                                trace_state.packed_pack_gpu_total_ns += (
+                                    pack_gpu_ns)
+                remote_slot = response.get("remote_slot")
+                if not isinstance(remote_slot, int) or remote_slot < 0:
+                    raise RuntimeError("invalid remote packed staging slot")
+                self._start_packed_read(state, chunk, remote_slot)
+
+    def _launch_packed_scatter(
+            self, chunk: _PackedChunkState
+    ) -> tuple[torch.cuda.Event, torch.cuda.Event]:
+        assert self._packed_staging is not None
+        assert self._packed_region_ptrs is not None
+        assert self._packed_scatter_stream is not None
+        assert chunk.local_slot is not None
+        staging = self._packed_staging.narrow(
+            0, chunk.local_slot * self._packed_slot_bytes,
+            self._packed_slot_bytes)
+        device = self._packed_staging.device
+        start_event = torch.cuda.Event(enable_timing=True)
+        end_event = torch.cuda.Event(enable_timing=True)
+        with torch.cuda.device(device), torch.cuda.stream(
+                self._packed_scatter_stream):
+            ids = torch.tensor(chunk.local_block_ids,
+                               dtype=torch.int64,
+                               device=device)
+            start_event.record(self._packed_scatter_stream)
+            _launch_scatter_regions(self._packed_region_ptrs, ids, staging,
+                                    self._packed_block_bytes)
+            end_event.record(self._packed_scatter_stream)
+        return start_event, end_event
+
+    def _packed_remote_agent_name(self, state: _PackedRequestState) -> str:
+        tp_ratio = self._tp_size[self.engine_id] // state.remote_tp_size
+        remote_rank = self.tp_rank // tp_ratio
+        return self._remote_agents[state.dst_engine_id][remote_rank]
+
+    def _poll_packed_transfers(self) -> set[str]:
+        if not getattr(self, "_packed_requests", None):
+            return set()
+        self._poll_packed_control_responses()
+        proc_checks_by_req: defaultdict[str, int] = defaultdict(int)
+
+        for state in list(self._packed_requests.values()):
+            for chunk in state.chunks:
+                if chunk.status != "reading":
+                    continue
+                assert chunk.handle is not None
+                xfer_state = self.nixl_wrapper.check_xfer_state(chunk.handle)
+                if xfer_state == "PROC":
+                    proc_checks_by_req[state.request_id] += 1
+                    continue
+                if xfer_state != "DONE":
+                    raise RuntimeError(
+                        f"Packed transfer failed with state {xfer_state}")
+                self.nixl_wrapper.release_xfer_handle(chunk.handle)
+                self.xfer_stats.record_transfer()
+                self._send_packed_control(state, {
+                    "type": "release",
+                    "key": chunk.key,
+                })
+                (chunk.scatter_start_event,
+                 chunk.scatter_event) = self._launch_packed_scatter(chunk)
+                chunk.status = "scattering"
+                state.read_chunks_done += 1
+
+            if (state.read_chunks_done == len(state.chunks)
+                    and not state.notification_sent):
+                self.nixl_wrapper.send_notif(
+                    self._packed_remote_agent_name(state),
+                    notif_msg=state.notif_id)
+                state.notification_sent = True
+
+        done_req_ids: set[str] = set()
+        for state in list(self._packed_requests.values()):
+            for chunk in state.chunks:
+                if (chunk.status != "scattering" or chunk.scatter_event is None
+                        or not chunk.scatter_event.query()):
+                    continue
+                assert chunk.local_slot is not None
+                if (self._pd_trace_enabled
+                        and chunk.scatter_start_event is not None):
+                    scatter_gpu_ns = int(
+                        chunk.scatter_start_event.elapsed_time(
+                            chunk.scatter_event) * 1_000_000)
+                    with self._transfer_trace_lock:
+                        trace_state = self._transfer_trace_states.get(
+                            state.request_id)
+                        if trace_state is not None:
+                            trace_state.packed_scatter_gpu_total_ns += (
+                                scatter_gpu_ns)
+                self._packed_local_free_slots.append(chunk.local_slot)
+                chunk.local_slot = None
+                chunk.status = "done"
+                state.scatter_chunks_done += 1
+            done = state.scatter_chunks_done == len(state.chunks)
+            self._record_transfer_poll(state.request_id,
+                                       proc_checks_by_req[state.request_id],
+                                       done=done)
+            if done:
+                num_handles = len(state.chunks)
+                if self._pd_transfer_sleep_ms <= 0:
+                    self._trace_recv_transfer_done(state.request_id,
+                                                   num_handles)
+                    done_req_ids.add(state.request_id)
+                else:
+                    ready_at = (time.perf_counter() +
+                                self._pd_transfer_sleep_ms / 1000.0)
+                    trace_event("pull_transfer_sleep_start",
+                                state.request_id,
+                                role="decode",
+                                sleep_ms=self._pd_transfer_sleep_ms,
+                                num_handles=num_handles)
+                    self._delayed_recving_transfers[state.request_id] = (
+                        ready_at, num_handles)
+                for chunk in state.chunks:
+                    self._packed_chunks_by_key.pop(chunk.key, None)
+                del self._packed_requests[state.request_id]
+
+        self._schedule_packed_chunks()
+        return done_req_ids
+
+    def _read_blocks(self,
+                     local_block_ids: list[int],
+                     remote_block_ids: list[int],
+                     dst_engine_id: str,
+                     request_id: str,
+                     remote_host: Optional[str] = None,
+                     remote_port: Optional[int] = None,
+                     remote_tp_size: Optional[int] = None):
+        # The experimental packed path stages on both peers: the remote/source
+        # worker gathers before READ, and the local/reader worker scatters only
+        # after NIXL reports DONE. Both phases are advanced asynchronously from
+        # get_finished(), so start_load_kv() remains non-blocking.
 
         # Number of D TP workers that will read from dst P. Propagate tp_ratio
         # on notification so that dst worker can wait before freeing blocks.
@@ -1962,6 +2752,80 @@ class NixlConnectorWorker:
         canonicalized_reverse_run_count = 0
         canonicalized_reverse_block_count = 0
 
+        submitted_local_block_ids = local_block_ids
+        submitted_remote_block_ids = remote_block_ids
+        if (not self.block_window_per_layer
+                and self._canonicalize_reverse_block_pairs):
+            (submitted_local_block_ids, submitted_remote_block_ids,
+             canonicalized_reverse_run_count, canonicalized_reverse_block_count
+             ) = _canonicalize_paired_reverse_runs(local_block_ids,
+                                                   remote_block_ids)
+
+        configured_mode = getattr(self, "_nixl_transfer_mode", "direct")
+        forward_ranges = 0
+        if configured_mode != "direct" or self._pd_trace_enabled:
+            forward_ranges = _count_forward_ranges(submitted_local_block_ids,
+                                                   submitted_remote_block_ids)
+        wants_packed = _should_use_packed_path(
+            configured_mode, num_local_blocks, forward_ranges,
+            getattr(self, "_packed_auto_range_threshold", 16),
+            getattr(self, "_packed_auto_block_threshold", 32))
+        packed_supported = (getattr(self, "_packed_available", False)
+                            and not self.block_window_per_layer and
+                            dst_engine_id in self._packed_dst_xfer_side_handles
+                            and remote_host is not None
+                            and remote_port is not None
+                            and remote_tp_size is not None
+                            and request_id not in self._packed_requests)
+        selected_path = "packed" if wants_packed and packed_supported else "direct"
+        trace_event(
+            "pull_transfer_path_selected",
+            request_id,
+            role="decode",
+            configured_mode=configured_mode,
+            selected_path=selected_path,
+            num_blocks=num_local_blocks,
+            forward_ranges=forward_ranges,
+            auto_range_threshold=getattr(self, "_packed_auto_range_threshold",
+                                         16),
+            auto_block_threshold=getattr(self, "_packed_auto_block_threshold",
+                                         32),
+            packed_supported=packed_supported)
+        if wants_packed and not packed_supported:
+            logger.warning_once(
+                "NIXL %s mode selected packed for B=%s K=%s, but this peer or "
+                "layout is unsupported; falling back to direct READ",
+                configured_mode, num_local_blocks, forward_ranges)
+        if self._pd_trace_enabled:
+            with self._transfer_trace_lock:
+                trace_state = self._transfer_trace_states.get(request_id)
+                if trace_state is not None:
+                    trace_state.configured_transfer_mode = configured_mode
+                    trace_state.selected_transfer_path = selected_path
+                    trace_state.selector_num_blocks = num_local_blocks
+                    trace_state.selector_forward_ranges = forward_ranges
+
+        if selected_path == "packed":
+            assert remote_host is not None
+            assert remote_port is not None
+            assert remote_tp_size is not None
+            self._start_packed_transfer(
+                request_id=request_id,
+                dst_engine_id=dst_engine_id,
+                local_block_ids=submitted_local_block_ids,
+                remote_block_ids=submitted_remote_block_ids,
+                remote_host=remote_host,
+                remote_port=remote_port,
+                remote_tp_size=remote_tp_size,
+                notif_id=notif_id,
+                block_pair_stats=block_pair_stats,
+                block_pair_stats_ns=block_pair_stats_ns,
+                canonicalized_reverse_run_count=(
+                    canonicalized_reverse_run_count),
+                canonicalized_reverse_block_count=(
+                    canonicalized_reverse_block_count))
+            return
+
         # Get side handles.
         local_xfer_side_handle = self.src_xfer_side_handle
         remote_xfer_side_handle = self.dst_xfer_side_handles[dst_engine_id]
@@ -1977,14 +2841,6 @@ class NixlConnectorWorker:
         remote_block_descs_ids: np.ndarray
         if not self.block_window_per_layer:
             # Default case: assume global attention
-            submitted_local_block_ids = local_block_ids
-            submitted_remote_block_ids = remote_block_ids
-            if self._canonicalize_reverse_block_pairs:
-                (submitted_local_block_ids, submitted_remote_block_ids,
-                 canonicalized_reverse_run_count,
-                 canonicalized_reverse_block_count
-                 ) = _canonicalize_paired_reverse_runs(local_block_ids,
-                                                       remote_block_ids)
             remote_block_descs_ids = self._get_block_descs_ids(
                 dst_engine_id, submitted_remote_block_ids)
             local_block_descs_ids = self._get_block_descs_ids(
@@ -2070,6 +2926,7 @@ class NixlConnectorWorker:
             request_id,
             role="decode",
             remote_engine_id=dst_engine_id,
+            transfer_path="direct",
             num_local_blocks=len(local_block_ids),
             num_remote_blocks=len(remote_block_ids),
             num_local_descs=len(local_block_descs_ids),
@@ -2154,6 +3011,12 @@ class NixlConnectorWorker:
             for handle, _ in handles:
                 self.nixl_wrapper.release_xfer_handle(handle)
         self._recving_transfers.clear()
+        for state in self._packed_requests.values():
+            for chunk in state.chunks:
+                if chunk.status == "reading" and chunk.handle is not None:
+                    self.nixl_wrapper.release_xfer_handle(chunk.handle)
+        self._packed_requests.clear()
+        self._packed_chunks_by_key.clear()
         self._delayed_recving_transfers.clear()
         self._transfer_trace_states.clear()
         if self.src_xfer_side_handle:
@@ -2162,6 +3025,19 @@ class NixlConnectorWorker:
         for dst_xfer_side_handle in self.dst_xfer_side_handles.values():
             self.nixl_wrapper.release_dlist_handle(dst_xfer_side_handle)
         self.dst_xfer_side_handles.clear()
+        if self._packed_src_xfer_side_handle:
+            self.nixl_wrapper.release_dlist_handle(
+                self._packed_src_xfer_side_handle)
+            self._packed_src_xfer_side_handle = 0
+        for handle in self._packed_dst_xfer_side_handles.values():
+            self.nixl_wrapper.release_dlist_handle(handle)
+        self._packed_dst_xfer_side_handles.clear()
+        for socket in self._packed_control_sockets.values():
+            socket.close(linger=0)
+        self._packed_control_sockets.clear()
+        if self._packed_control_context is not None:
+            self._packed_control_context.destroy(linger=0)
+            self._packed_control_context = None
         for remote_agents in self._remote_agents.values():
             for agent_name in remote_agents.values():
                 self.nixl_wrapper.remove_remote_agent(agent_name)

@@ -27,7 +27,8 @@ from vllm.distributed.kv_transfer.kv_connector.v1.multi_connector import (
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl_connector import (
     KVConnectorRole, NixlAgentMetadata, NixlConnector, NixlConnectorMetadata,
     NixlConnectorWorker, NixlKVConnectorStats, _analyze_block_pairs,
-    _canonicalize_paired_reverse_runs, _NixlTransferTraceState)
+    _canonicalize_paired_reverse_runs, _NixlTransferTraceState,
+    _should_use_packed_path)
 from vllm.distributed.kv_transfer.kv_transfer_state import (
     ensure_kv_transfer_shutdown, has_kv_transfer_group)
 from vllm.forward_context import ForwardContext
@@ -1013,6 +1014,34 @@ def test_analyze_block_pairs(local_blocks, remote_blocks, expected):
 def test_analyze_block_pairs_rejects_mismatched_counts():
     with pytest.raises(ValueError, match="counts must match"):
         _analyze_block_pairs([1, 2], [3])
+
+
+@pytest.mark.parametrize(
+    "mode,num_blocks,forward_ranges,expected",
+    [
+        ("direct", 1, 1, False),
+        ("direct", 512, 512, False),
+        ("packed", 1, 1, True),
+        ("packed", 512, 1, True),
+        ("auto", 32, 1, True),
+        ("auto", 33, 1, False),
+        ("auto", 512, 15, False),
+        ("auto", 512, 16, True),
+        ("auto", 2400, 16, True),
+        ("auto", 0, 0, False),
+    ],
+)
+def test_packed_path_selector(mode, num_blocks, forward_ranges, expected):
+    assert _should_use_packed_path(mode,
+                                   num_blocks,
+                                   forward_ranges,
+                                   auto_range_threshold=16,
+                                   auto_block_threshold=32) is expected
+
+
+def test_packed_path_selector_rejects_unknown_mode():
+    with pytest.raises(ValueError, match="unsupported"):
+        _should_use_packed_path("unknown", 1, 1, 16, 32)
 
 
 @pytest.mark.parametrize(
