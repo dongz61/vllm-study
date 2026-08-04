@@ -39,6 +39,13 @@ TRANSFER_DELAY_MS_LIST=${TRANSFER_DELAY_MS_LIST:-0}
 NIXL_TRANSFER_MODE=${NIXL_TRANSFER_MODE:-direct}
 NIXL_PACKED_STAGING_MIB=${NIXL_PACKED_STAGING_MIB:-64}
 NIXL_PACKED_STAGING_SLOTS=${NIXL_PACKED_STAGING_SLOTS:-64}
+# Per-side staging slot counts. Slots are allocated and pooled independently on
+# each process (P uses only source slots, D uses only local slots), so P and D
+# can differ. Both default to the symmetric NIXL_PACKED_STAGING_SLOTS. Diagnostics
+# show P-side source slots are rarely the bottleneck (busy_count~0) while D-side
+# local slots gate transfer, so P can run leaner than D to save VRAM.
+PREFILL_PACKED_STAGING_SLOTS=${PREFILL_PACKED_STAGING_SLOTS:-${NIXL_PACKED_STAGING_SLOTS}}
+DECODE_PACKED_STAGING_SLOTS=${DECODE_PACKED_STAGING_SLOTS:-${NIXL_PACKED_STAGING_SLOTS}}
 NIXL_PACKED_AUTO_RANGE_THRESHOLD=${NIXL_PACKED_AUTO_RANGE_THRESHOLD:-64}
 
 require_value() {
@@ -263,7 +270,8 @@ if [[ "${PAIRED_AXIS}" == "transfer_mode" ]]; then
   fi
 fi
 for packed_integer_name in NIXL_PACKED_STAGING_MIB \
-  NIXL_PACKED_STAGING_SLOTS NIXL_PACKED_AUTO_RANGE_THRESHOLD; do
+  NIXL_PACKED_STAGING_SLOTS PREFILL_PACKED_STAGING_SLOTS \
+  DECODE_PACKED_STAGING_SLOTS NIXL_PACKED_AUTO_RANGE_THRESHOLD; do
   require_positive_integer "${packed_integer_name}"
 done
 
@@ -431,7 +439,9 @@ python3 - \
   "${PAIRED_AXIS}" \
   "${TRANSFER_MODE_A}" \
   "${TRANSFER_MODE_B}" \
-  "${REVERSE_VARIANT}" <<'PY'
+  "${REVERSE_VARIANT}" \
+  "${PREFILL_PACKED_STAGING_SLOTS}" \
+  "${DECODE_PACKED_STAGING_SLOTS}" <<'PY'
 import json
 import sys
 from datetime import datetime, timezone
@@ -444,7 +454,8 @@ from pathlib import Path
  transfer_delay_ms, diagnostic_transfer_delay_ms, nixl_transfer_mode,
  packed_staging_mib, packed_staging_slots,
  packed_auto_range_threshold, paired_axis, transfer_mode_a,
- transfer_mode_b, reverse_variant) = sys.argv[1:]
+ transfer_mode_b, reverse_variant, prefill_packed_staging_slots,
+ decode_packed_staging_slots) = sys.argv[1:]
 manifest = {
     "created_at": datetime.now(timezone.utc).isoformat(),
     "workload": workload_name,
@@ -487,6 +498,8 @@ manifest = {
     "nixl_transfer_mode": nixl_transfer_mode,
     "nixl_packed_staging_mib": int(packed_staging_mib),
     "nixl_packed_staging_slots": int(packed_staging_slots),
+    "prefill_packed_staging_slots": int(prefill_packed_staging_slots),
+    "decode_packed_staging_slots": int(decode_packed_staging_slots),
     "nixl_packed_auto_range_threshold": int(packed_auto_range_threshold),
     "variant_order": (
         "odd repetitions: off,on; even repetitions: on,off"
@@ -673,12 +686,18 @@ kv_config() {
   local role=$1
   local engine_id=$2
   local variant=$3
-  local reverse_variant transfer_mode enabled
+  local reverse_variant transfer_mode enabled staging_slots
   reverse_variant=$(resolve_reverse_variant "${variant}")
   transfer_mode=$(resolve_transfer_mode "${variant}")
   enabled=$(bool_json "${reverse_variant}")
+  # P and D pool staging slots independently, so each side gets its own count.
+  if [[ "${role}" == "kv_producer" ]]; then
+    staging_slots="${PREFILL_PACKED_STAGING_SLOTS}"
+  else
+    staging_slots="${DECODE_PACKED_STAGING_SLOTS}"
+  fi
   printf '%s\n' \
-    "{\"kv_connector\":\"NixlConnector\",\"kv_role\":\"${role}\",\"engine_id\":\"${engine_id}\",\"kv_connector_extra_config\":{\"canonicalize_reverse_block_pairs\":${enabled},\"nixl_transfer_mode\":\"${transfer_mode}\",\"nixl_packed_staging_mib\":${NIXL_PACKED_STAGING_MIB},\"nixl_packed_staging_slots\":${NIXL_PACKED_STAGING_SLOTS},\"nixl_packed_auto_range_threshold\":${NIXL_PACKED_AUTO_RANGE_THRESHOLD}}}"
+    "{\"kv_connector\":\"NixlConnector\",\"kv_role\":\"${role}\",\"engine_id\":\"${engine_id}\",\"kv_connector_extra_config\":{\"canonicalize_reverse_block_pairs\":${enabled},\"nixl_transfer_mode\":\"${transfer_mode}\",\"nixl_packed_staging_mib\":${NIXL_PACKED_STAGING_MIB},\"nixl_packed_staging_slots\":${staging_slots},\"nixl_packed_auto_range_threshold\":${NIXL_PACKED_AUTO_RANGE_THRESHOLD}}}"
 }
 
 start_vllm_server() {
@@ -959,7 +978,7 @@ if [[ "${PAIRED_AXIS}" == "transfer_mode" ]]; then
 else
   echo "NIXL transfer mode: ${NIXL_TRANSFER_MODE}"
 fi
-echo "Packed staging: ${NIXL_PACKED_STAGING_MIB} MiB x ${NIXL_PACKED_STAGING_SLOTS} slots"
+echo "Packed staging: ${NIXL_PACKED_STAGING_MIB} MiB x slots (P=${PREFILL_PACKED_STAGING_SLOTS}, D=${DECODE_PACKED_STAGING_SLOTS})"
 echo "Packed auto range threshold: ${NIXL_PACKED_AUTO_RANGE_THRESHOLD}"
 echo "Transfer delays (ms): ${TRANSFER_DELAY_VALUES[*]}"
 if [[ "${DATASET_LOADER}" == "mooncake" ]]; then
