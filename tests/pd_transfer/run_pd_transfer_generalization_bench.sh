@@ -22,6 +22,16 @@ MOONCAKE_TOKEN_SEED=${MOONCAKE_TOKEN_SEED:-0}
 # paired runs OFF and ON in alternating order across repetitions.  Single
 # variant modes are useful for smoke tests and workload characterization.
 VARIANT_MODE=${VARIANT_MODE:-paired}
+# Which knob the paired A/B alternates. "reverse" (default, backward
+# compatible) pairs the reverse-block canonicalization OFF vs ON. "transfer_mode"
+# pairs the NIXL transfer path A vs B (e.g. direct vs auto) on the same GPU pair
+# with ABBA ordering, holding reverse canonicalization fixed at REVERSE_VARIANT.
+PAIRED_AXIS=${PAIRED_AXIS:-reverse}
+# When PAIRED_AXIS=transfer_mode, the two paths compared. A is the baseline.
+TRANSFER_MODE_A=${TRANSFER_MODE_A:-direct}
+TRANSFER_MODE_B=${TRANSFER_MODE_B:-auto}
+# When PAIRED_AXIS=transfer_mode, reverse canonicalization is held fixed here.
+REVERSE_VARIANT=${REVERSE_VARIANT:-off}
 # Extra non-blocking delay after NIXL receive completion and before the Decode
 # worker reports the remote KV as ready. Keep the default at zero so existing
 # OFF/ON generalization runs retain their original behavior.
@@ -216,6 +226,42 @@ case "${NIXL_TRANSFER_MODE}" in
     exit 1
     ;;
 esac
+case "${PAIRED_AXIS}" in
+  reverse|transfer_mode)
+    ;;
+  *)
+    echo "PAIRED_AXIS must be reverse or transfer_mode; got: ${PAIRED_AXIS}" >&2
+    exit 1
+    ;;
+esac
+case "${REVERSE_VARIANT}" in
+  off|on)
+    ;;
+  *)
+    echo "REVERSE_VARIANT must be off or on; got: ${REVERSE_VARIANT}" >&2
+    exit 1
+    ;;
+esac
+for transfer_mode_name in TRANSFER_MODE_A TRANSFER_MODE_B; do
+  case "${!transfer_mode_name}" in
+    direct|packed|auto)
+      ;;
+    *)
+      echo "${transfer_mode_name} must be direct, packed, or auto; got: ${!transfer_mode_name}" >&2
+      exit 1
+      ;;
+  esac
+done
+if [[ "${PAIRED_AXIS}" == "transfer_mode" ]]; then
+  if [[ "${VARIANT_MODE}" != "paired" ]]; then
+    echo "PAIRED_AXIS=transfer_mode requires VARIANT_MODE=paired" >&2
+    exit 1
+  fi
+  if [[ "${TRANSFER_MODE_A}" == "${TRANSFER_MODE_B}" ]]; then
+    echo "PAIRED_AXIS=transfer_mode needs distinct TRANSFER_MODE_A/TRANSFER_MODE_B" >&2
+    exit 1
+  fi
+fi
 for packed_integer_name in NIXL_PACKED_STAGING_MIB \
   NIXL_PACKED_STAGING_SLOTS NIXL_PACKED_AUTO_RANGE_THRESHOLD; do
   require_positive_integer "${packed_integer_name}"
@@ -381,7 +427,11 @@ python3 - \
   "${NIXL_TRANSFER_MODE}" \
   "${NIXL_PACKED_STAGING_MIB}" \
   "${NIXL_PACKED_STAGING_SLOTS}" \
-  "${NIXL_PACKED_AUTO_RANGE_THRESHOLD}" <<'PY'
+  "${NIXL_PACKED_AUTO_RANGE_THRESHOLD}" \
+  "${PAIRED_AXIS}" \
+  "${TRANSFER_MODE_A}" \
+  "${TRANSFER_MODE_B}" \
+  "${REVERSE_VARIANT}" <<'PY'
 import json
 import sys
 from datetime import datetime, timezone
@@ -393,7 +443,8 @@ from pathlib import Path
  mooncake_token_seed, variant_mode, diagnostic_request_rates,
  transfer_delay_ms, diagnostic_transfer_delay_ms, nixl_transfer_mode,
  packed_staging_mib, packed_staging_slots,
- packed_auto_range_threshold) = sys.argv[1:]
+ packed_auto_range_threshold, paired_axis, transfer_mode_a,
+ transfer_mode_b, reverse_variant) = sys.argv[1:]
 manifest = {
     "created_at": datetime.now(timezone.utc).isoformat(),
     "workload": workload_name,
@@ -432,6 +483,7 @@ manifest = {
     ),
     "server_configuration": "vllm-defaults-plus-required-pd-arguments",
     "variant_mode": variant_mode,
+    "paired_axis": paired_axis,
     "nixl_transfer_mode": nixl_transfer_mode,
     "nixl_packed_staging_mib": int(packed_staging_mib),
     "nixl_packed_staging_slots": int(packed_staging_slots),
@@ -441,6 +493,18 @@ manifest = {
         if variant_mode == "paired" else variant_mode
     ),
 }
+if paired_axis == "transfer_mode":
+    # On the transfer_mode axis, the off/on labels are slots for the two NIXL
+    # transfer paths (A=off=baseline, B=on=treatment), and reverse
+    # canonicalization is held fixed. Record the mapping so the aggregator and
+    # later analysis interpret the labels correctly.
+    manifest["paired_label_mapping"] = {
+        "off": transfer_mode_a,
+        "on": transfer_mode_b,
+    }
+    manifest["reverse_variant_fixed"] = reverse_variant
+else:
+    manifest["paired_label_mapping"] = {"off": "reverse-off", "on": "reverse-on"}
 Path(path).write_text(
     json.dumps(manifest, indent=2, ensure_ascii=False) + "\n",
     encoding="utf-8",
@@ -571,29 +635,50 @@ wait_for_proxy() {
   done
 }
 
-variant_json() {
+bool_json() {
   case "$1" in
-    off)
-      printf 'false'
-      ;;
-    on)
-      printf 'true'
-      ;;
-    *)
-      echo "Unknown variant: $1" >&2
-      return 1
-      ;;
+    off) printf 'false' ;;
+    on)  printf 'true' ;;
+    *)   echo "Unknown reverse variant: $1" >&2; return 1 ;;
   esac
+}
+
+# Resolve the reverse-canonicalization flag and the NIXL transfer mode for a
+# given paired label (off/on). The label's meaning depends on PAIRED_AXIS:
+#   reverse:        off/on toggle canonicalization; transfer mode is the global
+#                   NIXL_TRANSFER_MODE (backward-compatible behavior).
+#   transfer_mode:  off/on select TRANSFER_MODE_A/TRANSFER_MODE_B; reverse
+#                   canonicalization is held fixed at REVERSE_VARIANT.
+resolve_reverse_variant() {
+  if [[ "${PAIRED_AXIS}" == "transfer_mode" ]]; then
+    printf '%s' "${REVERSE_VARIANT}"
+  else
+    printf '%s' "$1"
+  fi
+}
+
+resolve_transfer_mode() {
+  if [[ "${PAIRED_AXIS}" == "transfer_mode" ]]; then
+    case "$1" in
+      off) printf '%s' "${TRANSFER_MODE_A}" ;;
+      on)  printf '%s' "${TRANSFER_MODE_B}" ;;
+      *)   echo "Unknown transfer-mode label: $1" >&2; return 1 ;;
+    esac
+  else
+    printf '%s' "${NIXL_TRANSFER_MODE}"
+  fi
 }
 
 kv_config() {
   local role=$1
   local engine_id=$2
   local variant=$3
-  local enabled
-  enabled=$(variant_json "${variant}")
+  local reverse_variant transfer_mode enabled
+  reverse_variant=$(resolve_reverse_variant "${variant}")
+  transfer_mode=$(resolve_transfer_mode "${variant}")
+  enabled=$(bool_json "${reverse_variant}")
   printf '%s\n' \
-    "{\"kv_connector\":\"NixlConnector\",\"kv_role\":\"${role}\",\"engine_id\":\"${engine_id}\",\"kv_connector_extra_config\":{\"canonicalize_reverse_block_pairs\":${enabled},\"nixl_transfer_mode\":\"${NIXL_TRANSFER_MODE}\",\"nixl_packed_staging_mib\":${NIXL_PACKED_STAGING_MIB},\"nixl_packed_staging_slots\":${NIXL_PACKED_STAGING_SLOTS},\"nixl_packed_auto_range_threshold\":${NIXL_PACKED_AUTO_RANGE_THRESHOLD}}}"
+    "{\"kv_connector\":\"NixlConnector\",\"kv_role\":\"${role}\",\"engine_id\":\"${engine_id}\",\"kv_connector_extra_config\":{\"canonicalize_reverse_block_pairs\":${enabled},\"nixl_transfer_mode\":\"${transfer_mode}\",\"nixl_packed_staging_mib\":${NIXL_PACKED_STAGING_MIB},\"nixl_packed_staging_slots\":${NIXL_PACKED_STAGING_SLOTS},\"nixl_packed_auto_range_threshold\":${NIXL_PACKED_AUTO_RANGE_THRESHOLD}}}"
 }
 
 start_vllm_server() {
@@ -867,7 +952,13 @@ echo "Workload: ${WORKLOAD_NAME}, mixed input/output lengths"
 echo "Dataset loader: ${DATASET_LOADER}"
 echo "Dataset source format: ${DATASET_SOURCE_FORMAT}"
 echo "Variant mode: ${VARIANT_MODE}"
-echo "NIXL transfer mode: ${NIXL_TRANSFER_MODE}"
+echo "Paired axis: ${PAIRED_AXIS}"
+if [[ "${PAIRED_AXIS}" == "transfer_mode" ]]; then
+  echo "  Paired transfer modes: off=${TRANSFER_MODE_A} (baseline) vs on=${TRANSFER_MODE_B} (treatment)"
+  echo "  Reverse canonicalization held fixed at: ${REVERSE_VARIANT}"
+else
+  echo "NIXL transfer mode: ${NIXL_TRANSFER_MODE}"
+fi
 echo "Packed staging: ${NIXL_PACKED_STAGING_MIB} MiB x ${NIXL_PACKED_STAGING_SLOTS} slots"
 echo "Packed auto range threshold: ${NIXL_PACKED_AUTO_RANGE_THRESHOLD}"
 echo "Transfer delays (ms): ${TRANSFER_DELAY_VALUES[*]}"
@@ -976,7 +1067,11 @@ if [[ "${RUN_DIAGNOSTIC_TRACE:-1}" == "1" ]]; then
 fi
 
 if [[ "${VARIANT_MODE}" == "paired" ]]; then
-  echo "Done. Aggregate OFF/ON performance with:"
+  if [[ "${PAIRED_AXIS}" == "transfer_mode" ]]; then
+    echo "Done. Aggregate paired ${TRANSFER_MODE_A}/${TRANSFER_MODE_B} performance with:"
+  else
+    echo "Done. Aggregate OFF/ON performance with:"
+  fi
   echo "  python tests/pd_transfer/compare_pd_generalization_perf.py ${RUN_ROOT}"
 else
   echo "Done. Single-variant results are in ${RUN_ROOT}."

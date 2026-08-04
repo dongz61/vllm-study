@@ -72,6 +72,31 @@ def _rate_sort_key(rate: str) -> tuple[int, float]:
     return (0, float(rate))
 
 
+def _read_run_manifest(root: Path) -> dict[str, Any]:
+    """Read run_manifest.json if present; return {} when missing/invalid."""
+    manifest_path = root / "run_manifest.json"
+    if not manifest_path.is_file():
+        return {}
+    try:
+        with manifest_path.open("r", encoding="utf-8-sig") as file:
+            data = json.load(file)
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _label_names(manifest: dict[str, Any]) -> tuple[str, str]:
+    """Human-readable names for the off/on paired slots.
+
+    On the reverse axis these are literally OFF/ON. On the transfer_mode axis
+    they map to the two NIXL transfer paths (off=baseline A, on=treatment B).
+    """
+    mapping = manifest.get("paired_label_mapping")
+    if isinstance(mapping, dict) and "off" in mapping and "on" in mapping:
+        return str(mapping["off"]), str(mapping["on"])
+    return "off", "on"
+
+
 def load_performance_results(
     root: Path,
 ) -> tuple[dict[tuple[int, str, str], ResultRecord], list[str]]:
@@ -439,6 +464,10 @@ def main() -> int:
     parser.add_argument("root", type=Path)
     args = parser.parse_args()
 
+    manifest = _read_run_manifest(args.root)
+    paired_axis = str(manifest.get("paired_axis", "reverse"))
+    off_name, on_name = _label_names(manifest)
+
     try:
         pairwise, summary, problems = analyze_results(args.root)
         diagnostic = _summarize_diagnostic_traces(args.root)
@@ -459,7 +488,8 @@ def main() -> int:
         )
         print(
             f"rps={row['request_rate']} {row['metric']}: "
-            f"off={row['median_off']:.3f}, on={row['median_on']:.3f}, "
+            f"{off_name}={row['median_off']:.3f}, "
+            f"{on_name}={row['median_on']:.3f}, "
             f"median improvement={improvement_text}, "
             f"pairs={row['paired_repetitions']}")
 
@@ -484,16 +514,24 @@ def main() -> int:
                    if row["variant"] == "on"), None)
         if off is None:
             problems.append(
-                "diagnostic OFF run has no transfer profile records")
+                f"diagnostic {off_name} run has no transfer profile records")
         if on is None:
             problems.append(
-                "diagnostic ON run has no transfer profile records")
-        if off and off["canonicalized_block_count"]:
-            problems.append(
-                "diagnostic OFF run unexpectedly canonicalized reverse blocks")
-        if on and not on["canonicalized_block_count"]:
-            problems.append(
-                "diagnostic ON run did not canonicalize any reverse blocks")
+                f"diagnostic {on_name} run has no transfer profile records")
+        if paired_axis == "transfer_mode":
+            # Reverse canonicalization is held fixed on this axis, so neither
+            # slot is expected to canonicalize (unless REVERSE_VARIANT=on for
+            # both). The OFF-canonicalizes / ON-does-not checks below only apply
+            # to the reverse axis, so skip them here.
+            pass
+        else:
+            if off and off["canonicalized_block_count"]:
+                problems.append(
+                    "diagnostic OFF run unexpectedly canonicalized "
+                    "reverse blocks")
+            if on and not on["canonicalized_block_count"]:
+                problems.append(
+                    "diagnostic ON run did not canonicalize any reverse blocks")
 
     if problems:
         for problem in problems:
