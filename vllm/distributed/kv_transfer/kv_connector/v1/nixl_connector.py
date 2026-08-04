@@ -125,6 +125,14 @@ class _PackedChunkState:
     scatter_start_event: Optional[torch.cuda.Event] = None
     scatter_event: Optional[torch.cuda.Event] = None
     retry_at: float = 0.0
+    # Slot-contention diagnostics (see background 15.10 P1). created_ns marks
+    # when the chunk was queued; local_slot_acquired_ns marks when it finally
+    # obtained a D-side local slot. busy_count counts P-side "busy" replies
+    # (no free source slot); retry_count counts reschedules from those.
+    created_ns: Optional[int] = None
+    local_slot_acquired_ns: Optional[int] = None
+    busy_count: int = 0
+    retry_count: int = 0
 
 
 @dataclass
@@ -526,6 +534,13 @@ class _NixlTransferTraceState:
     packed_source_readiness_event_wait_count: int = 0
     packed_source_default_stream_fallback_count: int = 0
     packed_scatter_gpu_total_ns: int = 0
+    # Slot-contention diagnostics (background 15.10 P1). Populated D-side so the
+    # NIXL_PACKED_STAGING_SLOTS sweep can show slots -> contention -> wall.
+    packed_local_slot_queue_wait_total_ns: int = 0
+    packed_local_slot_queue_wait_max_ns: int = 0
+    packed_local_slot_queue_wait_count: int = 0
+    packed_source_busy_count: int = 0
+    packed_chunk_retry_count: int = 0
 
 
 class NixlConnectorMetadata(KVConnectorMetadata):
@@ -2254,6 +2269,14 @@ class NixlConnectorWorker:
                     state.packed_source_handler_total_ns) / 1_000_000, 6),
             packed_scatter_gpu_ms=round(
                 state.packed_scatter_gpu_total_ns / 1_000_000, 6),
+            packed_local_slot_queue_wait_ms=round(
+                state.packed_local_slot_queue_wait_total_ns / 1_000_000, 6),
+            packed_local_slot_queue_wait_max_ms=round(
+                state.packed_local_slot_queue_wait_max_ns / 1_000_000, 6),
+            packed_local_slot_queue_wait_count=(
+                state.packed_local_slot_queue_wait_count),
+            packed_source_busy_count=state.packed_source_busy_count,
+            packed_chunk_retry_count=state.packed_chunk_retry_count,
             handshake_cached=state.handshake_cached,
             num_local_blocks=state.num_local_blocks,
             num_remote_blocks=state.num_remote_blocks,
@@ -2602,7 +2625,8 @@ class NixlConnectorWorker:
                 request_id=request_id,
                 chunk_id=chunk_id,
                 local_block_ids=local_block_ids[start:end],
-                remote_block_ids=remote_block_ids[start:end])
+                remote_block_ids=remote_block_ids[start:end],
+                created_ns=time.perf_counter_ns())
             chunks.append(chunk)
             self._packed_chunks_by_key[key] = chunk
 
@@ -2657,6 +2681,26 @@ class NixlConnectorWorker:
                     if not self._packed_local_free_slots:
                         return
                     chunk.local_slot = self._packed_local_free_slots.popleft()
+                    chunk.local_slot_acquired_ns = time.perf_counter_ns()
+                    if (self._pd_trace_enabled
+                            and chunk.created_ns is not None):
+                        wait_ns = (chunk.local_slot_acquired_ns
+                                   - chunk.created_ns)
+                        with self._transfer_trace_lock:
+                            trace_state = self._transfer_trace_states.get(
+                                chunk.request_id)
+                            if trace_state is not None:
+                                profile = trace_state
+                                profile.\
+                                    packed_local_slot_queue_wait_total_ns += (
+                                        wait_ns)
+                                profile.packed_local_slot_queue_wait_max_ns = (
+                                    max(
+                                        profile
+                                        .packed_local_slot_queue_wait_max_ns,
+                                        wait_ns))
+                                profile.\
+                                    packed_local_slot_queue_wait_count += 1
                 self._send_packed_control(
                     state, {
                         "type": "pack",
@@ -2721,6 +2765,15 @@ class NixlConnectorWorker:
                 if response_type == "busy":
                     chunk.status = "retry"
                     chunk.retry_at = time.perf_counter() + 0.001
+                    chunk.busy_count += 1
+                    chunk.retry_count += 1
+                    if self._pd_trace_enabled:
+                        with self._transfer_trace_lock:
+                            trace_state = self._transfer_trace_states.get(
+                                chunk.request_id)
+                            if trace_state is not None:
+                                trace_state.packed_source_busy_count += 1
+                                trace_state.packed_chunk_retry_count += 1
                     continue
                 if response_type == "unavailable":
                     raise RuntimeError(
