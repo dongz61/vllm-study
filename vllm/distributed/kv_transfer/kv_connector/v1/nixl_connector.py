@@ -523,6 +523,8 @@ class _NixlTransferTraceState:
     packed_source_stream_wait_gpu_total_ns: int = 0
     packed_source_stream_wait_gpu_max_ns: int = 0
     packed_source_wait_count: int = 0
+    packed_source_readiness_event_wait_count: int = 0
+    packed_source_default_stream_fallback_count: int = 0
     packed_scatter_gpu_total_ns: int = 0
 
 
@@ -1052,6 +1054,16 @@ class NixlConnectorWorker:
         self._packed_source_free_slots: deque[int] = deque()
         self._packed_source_slots: dict[str, int] = {}
         self._packed_source_requests: dict[str, _PackedSourceRequestState] = {}
+        # Request-specific KV readiness events. Recorded on the P-side default
+        # (compute) stream the moment a request enters _reqs_to_send, i.e. right
+        # after its Prefill KV writes were enqueued. The pack stream waits on the
+        # matching event instead of blocking on the whole default stream, so it
+        # no longer waits for unrelated later Prefill work (see background 15.10).
+        # Written by the worker thread, read by the side-channel thread -> guard
+        # with a lock.
+        self._packed_source_ready_events: dict[str, torch.cuda.Event] = {}
+        self._packed_source_ready_lock = threading.Lock()
+        self._packed_source_device: Optional[torch.device] = None
         self._packed_local_free_slots: deque[int] = deque()
         self._packed_requests: dict[ReqId, _PackedRequestState] = {}
         self._packed_chunks_by_key: dict[str, _PackedChunkState] = {}
@@ -1308,6 +1320,7 @@ class NixlConnectorWorker:
             device=device)
         self._packed_pack_stream = torch.cuda.Stream(device=device)
         self._packed_scatter_stream = torch.cuda.Stream(device=device)
+        self._packed_source_device = device
 
         registration = self.nixl_wrapper.get_reg_descs(
             [(self._packed_staging.data_ptr(), total_bytes, self.tp_rank, "")],
@@ -1339,6 +1352,35 @@ class NixlConnectorWorker:
             self._packed_slot_bytes / (1024 * 1024),
             self._packed_blocks_per_slot, self.num_regions,
             self._packed_block_bytes)
+
+    def _record_packed_source_ready_event(self, req_id: str) -> None:
+        """Record a KV-readiness event on the default stream for this request.
+
+        Runs on the worker thread. Only meaningful when the packed path is
+        available on this (source/Prefill) worker; otherwise it is a no-op.
+        """
+        if not self._packed_available:
+            return
+        device = self._packed_source_device
+        if device is None:
+            return
+        event = torch.cuda.Event()
+        event.record(torch.cuda.default_stream(device))
+        with self._packed_source_ready_lock:
+            # Replace any stale event for the same id (should not normally
+            # happen, but keeps the map bounded and avoids leaks).
+            self._packed_source_ready_events[req_id] = event
+
+    def _pop_packed_source_ready_event(
+            self, req_id: str) -> Optional[torch.cuda.Event]:
+        """Fetch and remove the readiness event for a request, if present."""
+        with self._packed_source_ready_lock:
+            return self._packed_source_ready_events.pop(req_id, None)
+
+    def _discard_packed_source_ready_event(self, req_id: str) -> None:
+        """Drop a readiness event without using it (request done/expired)."""
+        with self._packed_source_ready_lock:
+            self._packed_source_ready_events.pop(req_id, None)
 
     def _handle_packed_control(
             self, request: dict[str, Any]) -> Optional[dict[str, Any]]:
@@ -1413,6 +1455,16 @@ class NixlConnectorWorker:
         slot = self._packed_source_free_slots.popleft()
         self._packed_source_slots[key] = slot
         wait_for_default_stream = not source_request.default_stream_ready
+        # Only the first chunk of a request establishes the dependency on the
+        # request's KV writes; prefer a request-specific readiness event so we
+        # do not block on unrelated later Prefill work. Fall back to a full
+        # default-stream wait if the event is missing (e.g. it was never
+        # recorded, or a race dropped it) so correctness is never at risk.
+        req_id = request.get("request_id")
+        readiness_event = None
+        used_readiness_event = 0
+        if wait_for_default_stream and isinstance(req_id, str):
+            readiness_event = self._pop_packed_source_ready_event(req_id)
         try:
             assert self._packed_staging is not None
             assert self._packed_region_ptrs is not None
@@ -1432,12 +1484,18 @@ class NixlConnectorWorker:
                 if stream_wait_start_event is not None:
                     stream_wait_start_event.record(self._packed_pack_stream)
                 if wait_for_default_stream:
-                    # The first chunk establishes the dependency between this
-                    # request's KV writes and the dedicated pack stream. Later
-                    # chunks are ordered after it on the same stream and must
-                    # not wait for unrelated Prefill work repeatedly.
-                    self._packed_pack_stream.wait_stream(
-                        torch.cuda.default_stream(device))
+                    if readiness_event is not None:
+                        # Wait only for this request's KV writes to complete,
+                        # not for every op currently queued on the default
+                        # stream. Later chunks stay ordered on the pack stream.
+                        self._packed_pack_stream.wait_event(readiness_event)
+                        used_readiness_event = 1
+                    else:
+                        # Fallback: establish the dependency by waiting on the
+                        # whole default stream. Correct but may block on
+                        # unrelated Prefill work.
+                        self._packed_pack_stream.wait_stream(
+                            torch.cuda.default_stream(device))
                 if stream_wait_end_event is not None:
                     stream_wait_end_event.record(self._packed_pack_stream)
                 ids = torch.tensor(block_ids, dtype=torch.int64, device=device)
@@ -1474,6 +1532,9 @@ class NixlConnectorWorker:
             "source_sync_wall_ns": sync_end_ns - sync_start_ns,
             "source_stream_wait_gpu_ns": stream_wait_gpu_ns,
             "source_default_stream_wait_count": int(wait_for_default_stream),
+            "source_readiness_event_wait_count": used_readiness_event,
+            "source_default_stream_fallback_count": int(
+                wait_for_default_stream and used_readiness_event == 0),
         }
 
     def _get_packed_control_socket(self,
@@ -2183,6 +2244,10 @@ class NixlConnectorWorker:
                 state.packed_source_stream_wait_gpu_max_ns / 1_000_000, 6),
             packed_source_default_stream_wait_count=(
                 state.packed_source_wait_count),
+            packed_source_readiness_event_wait_count=(
+                state.packed_source_readiness_event_wait_count),
+            packed_source_default_stream_fallback_count=(
+                state.packed_source_default_stream_fallback_count),
             packed_pack_control_other_ms=round(
                 max(
                     0, state.packed_pack_control_total_ns -
@@ -2305,6 +2370,8 @@ class NixlConnectorWorker:
             self._reqs_to_process.remove(req_id)
             del self._reqs_to_send[req_id]
             done_sending.add(req_id)
+            # Drop the readiness event for expired requests to avoid leaks.
+            self._discard_packed_source_ready_event(req_id)
 
         return done_sending, done_recving
 
@@ -2334,6 +2401,9 @@ class NixlConnectorWorker:
                     del self.consumer_notification_counts_by_req[req_id]
                     self._reqs_to_process.remove(req_id)
                     self._reqs_to_send.pop(req_id, None)
+                    # Drop any unused readiness event (e.g. direct path, or a
+                    # request that finished before its first pack chunk).
+                    self._discard_packed_source_ready_event(req_id)
         return notified_req_ids
 
     def _pop_done_transfers(
@@ -2487,6 +2557,12 @@ class NixlConnectorWorker:
         for req_id, expiration_time in metadata.reqs_to_send.items():
             if req_id in self._reqs_to_process:
                 self._reqs_to_send[req_id] = expiration_time
+                # Record a request-specific KV readiness event on the default
+                # (compute) stream. The request finished Prefill in an earlier
+                # step, so its KV writes are already enqueued ahead of this
+                # point; the pack stream can later wait on this event instead of
+                # the whole default stream and skip unrelated later Prefill work.
+                self._record_packed_source_ready_event(req_id)
 
     def _read_blocks_for_req(self, req_id: str, meta: ReqMeta):
         logger.debug(
@@ -2697,6 +2773,18 @@ class NixlConnectorWorker:
                                 "source_default_stream_wait_count", 0)
                             if isinstance(wait_count, int):
                                 trace_state.packed_source_wait_count += wait_count
+                            event_wait = response.get(
+                                "source_readiness_event_wait_count", 0)
+                            if isinstance(event_wait, int):
+                                trace_state.\
+                                    packed_source_readiness_event_wait_count += (
+                                        event_wait)
+                            fallback = response.get(
+                                "source_default_stream_fallback_count", 0)
+                            if isinstance(fallback, int):
+                                trace_state.\
+                                    packed_source_default_stream_fallback_count \
+                                    += fallback
                 remote_slot = response.get("remote_slot")
                 if not isinstance(remote_slot, int) or remote_slot < 0:
                     raise RuntimeError("invalid remote packed staging slot")
@@ -3133,6 +3221,8 @@ class NixlConnectorWorker:
         self._packed_requests.clear()
         self._packed_chunks_by_key.clear()
         self._packed_source_requests.clear()
+        with self._packed_source_ready_lock:
+            self._packed_source_ready_events.clear()
         self._delayed_recving_transfers.clear()
         self._transfer_trace_states.clear()
         if self.src_xfer_side_handle:
