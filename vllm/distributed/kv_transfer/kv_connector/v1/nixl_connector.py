@@ -2527,13 +2527,13 @@ class NixlConnectorWorker:
             "READ", self._packed_src_xfer_side_handle, local_indices,
             self._packed_dst_xfer_side_handles[state.dst_engine_id],
             remote_indices)
-        self._record_trace_phase(request_id=state.request_id,
+        self._record_trace_phase(req_id=state.request_id,
                                  phase="xfer_prepare",
                                  start_ns=prepare_start_ns,
                                  end_ns=time.perf_counter_ns())
         submit_start_ns = time.perf_counter_ns()
         self.nixl_wrapper.transfer(handle)
-        self._record_trace_phase(request_id=state.request_id,
+        self._record_trace_phase(req_id=state.request_id,
                                  phase="xfer_submit",
                                  start_ns=submit_start_ns,
                                  end_ns=time.perf_counter_ns())
