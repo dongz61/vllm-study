@@ -49,7 +49,7 @@ EngineId = str
 ReqId = str
 
 GET_META_MSG = b"get_meta_msg"
-_PACK_CONTROL_VERSION = 1
+_PACK_CONTROL_VERSION = 2
 _PACK_COPY_TILE_BYTES = 4096
 _NIXL_TRANSFER_MODES = frozenset(("direct", "packed", "auto"))
 
@@ -125,6 +125,13 @@ class _PackedChunkState:
     scatter_start_event: Optional[torch.cuda.Event] = None
     scatter_event: Optional[torch.cuda.Event] = None
     retry_at: float = 0.0
+
+
+@dataclass
+class _PackedSourceRequestState:
+    total_chunks: int
+    released_chunks: int = 0
+    default_stream_ready: bool = False
 
 
 @dataclass
@@ -515,6 +522,7 @@ class _NixlTransferTraceState:
     packed_source_sync_wall_max_ns: int = 0
     packed_source_stream_wait_gpu_total_ns: int = 0
     packed_source_stream_wait_gpu_max_ns: int = 0
+    packed_source_wait_count: int = 0
     packed_scatter_gpu_total_ns: int = 0
 
 
@@ -1043,6 +1051,7 @@ class NixlConnectorWorker:
         self._packed_scatter_stream: Optional[torch.cuda.Stream] = None
         self._packed_source_free_slots: deque[int] = deque()
         self._packed_source_slots: dict[str, int] = {}
+        self._packed_source_requests: dict[str, _PackedSourceRequestState] = {}
         self._packed_local_free_slots: deque[int] = deque()
         self._packed_requests: dict[ReqId, _PackedRequestState] = {}
         self._packed_chunks_by_key: dict[str, _PackedChunkState] = {}
@@ -1341,11 +1350,18 @@ class NixlConnectorWorker:
         key = request.get("key")
         if not isinstance(key, str):
             raise ValueError("packed control message is missing its key")
+        request_key = key.rsplit("/", 1)[0]
 
         if message_type == "release":
             slot = self._packed_source_slots.pop(key, None)
             if slot is not None:
                 self._packed_source_free_slots.append(slot)
+                source_request = self._packed_source_requests.get(request_key)
+                if source_request is not None:
+                    source_request.released_chunks += 1
+                    if (source_request.released_chunks
+                            >= source_request.total_chunks):
+                        self._packed_source_requests.pop(request_key, None)
             return None
         if message_type != "pack":
             raise ValueError(f"unknown packed control message: {message_type}")
@@ -1355,6 +1371,17 @@ class NixlConnectorWorker:
                 "type": "unavailable",
                 "key": key,
             }
+        total_chunks = request.get("total_chunks")
+        if not isinstance(total_chunks, int) or total_chunks <= 0:
+            raise ValueError("packed control message has invalid total_chunks")
+        source_request = self._packed_source_requests.get(request_key)
+        if source_request is None:
+            source_request = _PackedSourceRequestState(
+                total_chunks=total_chunks)
+            self._packed_source_requests[request_key] = source_request
+        elif source_request.total_chunks != total_chunks:
+            raise ValueError(
+                "packed control total_chunks changed within request")
         if key in self._packed_source_slots:
             return {
                 "version": _PACK_CONTROL_VERSION,
@@ -1366,6 +1393,7 @@ class NixlConnectorWorker:
                 "source_handler_ns": 0,
                 "source_sync_wall_ns": 0,
                 "source_stream_wait_gpu_ns": 0,
+                "source_default_stream_wait_count": 0,
             }
         if not self._packed_source_free_slots:
             return {
@@ -1384,6 +1412,7 @@ class NixlConnectorWorker:
 
         slot = self._packed_source_free_slots.popleft()
         self._packed_source_slots[key] = slot
+        wait_for_default_stream = not source_request.default_stream_ready
         try:
             assert self._packed_staging is not None
             assert self._packed_region_ptrs is not None
@@ -1393,7 +1422,7 @@ class NixlConnectorWorker:
             device = self._packed_staging.device
             stream_wait_start_event = None
             stream_wait_end_event = None
-            if self._pd_trace_enabled:
+            if self._pd_trace_enabled and wait_for_default_stream:
                 stream_wait_start_event = torch.cuda.Event(enable_timing=True)
                 stream_wait_end_event = torch.cuda.Event(enable_timing=True)
             start_event = torch.cuda.Event(enable_timing=True)
@@ -1402,8 +1431,13 @@ class NixlConnectorWorker:
                     self._packed_pack_stream):
                 if stream_wait_start_event is not None:
                     stream_wait_start_event.record(self._packed_pack_stream)
-                self._packed_pack_stream.wait_stream(
-                    torch.cuda.default_stream(device))
+                if wait_for_default_stream:
+                    # The first chunk establishes the dependency between this
+                    # request's KV writes and the dedicated pack stream. Later
+                    # chunks are ordered after it on the same stream and must
+                    # not wait for unrelated Prefill work repeatedly.
+                    self._packed_pack_stream.wait_stream(
+                        torch.cuda.default_stream(device))
                 if stream_wait_end_event is not None:
                     stream_wait_end_event.record(self._packed_pack_stream)
                 ids = torch.tensor(block_ids, dtype=torch.int64, device=device)
@@ -1421,6 +1455,8 @@ class NixlConnectorWorker:
                 stream_wait_gpu_ns = int(
                     stream_wait_start_event.elapsed_time(stream_wait_end_event)
                     * 1_000_000)
+            if wait_for_default_stream:
+                source_request.default_stream_ready = True
         except BaseException:
             self._packed_source_slots.pop(key, None)
             self._packed_source_free_slots.appendleft(slot)
@@ -1437,6 +1473,7 @@ class NixlConnectorWorker:
             "source_handler_ns": handler_end_ns - handler_start_ns,
             "source_sync_wall_ns": sync_end_ns - sync_start_ns,
             "source_stream_wait_gpu_ns": stream_wait_gpu_ns,
+            "source_default_stream_wait_count": int(wait_for_default_stream),
         }
 
     def _get_packed_control_socket(self,
@@ -2144,6 +2181,8 @@ class NixlConnectorWorker:
                 state.packed_source_stream_wait_gpu_total_ns / 1_000_000, 6),
             packed_source_stream_wait_gpu_max_ms=round(
                 state.packed_source_stream_wait_gpu_max_ns / 1_000_000, 6),
+            packed_source_default_stream_wait_count=(
+                state.packed_source_wait_count),
             packed_pack_control_other_ms=round(
                 max(
                     0, state.packed_pack_control_total_ns -
@@ -2548,6 +2587,7 @@ class NixlConnectorWorker:
                         "key": chunk.key,
                         "request_id": chunk.request_id,
                         "chunk_id": chunk.chunk_id,
+                        "total_chunks": len(state.chunks),
                         "block_ids": chunk.remote_block_ids,
                     })
                 chunk.pack_request_ns = time.perf_counter_ns()
@@ -2653,6 +2693,10 @@ class NixlConnectorWorker:
                                     profile
                                     .packed_source_stream_wait_gpu_max_ns,
                                     source_stream_wait_gpu_ns)
+                            wait_count = response.get(
+                                "source_default_stream_wait_count", 0)
+                            if isinstance(wait_count, int):
+                                trace_state.packed_source_wait_count += wait_count
                 remote_slot = response.get("remote_slot")
                 if not isinstance(remote_slot, int) or remote_slot < 0:
                     raise RuntimeError("invalid remote packed staging slot")
@@ -3088,6 +3132,7 @@ class NixlConnectorWorker:
                     self.nixl_wrapper.release_xfer_handle(chunk.handle)
         self._packed_requests.clear()
         self._packed_chunks_by_key.clear()
+        self._packed_source_requests.clear()
         self._delayed_recving_transfers.clear()
         self._transfer_trace_states.clear()
         if self.src_xfer_side_handle:

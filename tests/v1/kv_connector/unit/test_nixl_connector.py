@@ -9,7 +9,7 @@ import textwrap
 import threading
 import time
 import uuid
-from collections import defaultdict
+from collections import defaultdict, deque
 from typing import Optional
 from unittest.mock import MagicMock, patch
 
@@ -28,7 +28,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl_connector import (
     KVConnectorRole, NixlAgentMetadata, NixlConnector, NixlConnectorMetadata,
     NixlConnectorWorker, NixlKVConnectorStats, _analyze_block_pairs,
     _canonicalize_paired_reverse_runs, _NixlTransferTraceState,
-    _should_use_packed_path)
+    _PackedSourceRequestState, _should_use_packed_path)
 from vllm.distributed.kv_transfer.kv_transfer_state import (
     ensure_kv_transfer_shutdown, has_kv_transfer_group)
 from vllm.forward_context import ForwardContext
@@ -1302,6 +1302,7 @@ def test_pd_transfer_profile_is_emitted_once():
             packed_source_sync_wall_max_ns=3_000_000,
             packed_source_stream_wait_gpu_total_ns=4_000_000,
             packed_source_stream_wait_gpu_max_ns=2_500_000,
+            packed_source_wait_count=1,
         )
     }
     module = "vllm.distributed.kv_transfer.kv_connector.v1.nixl_connector"
@@ -1344,8 +1345,75 @@ def test_pd_transfer_profile_is_emitted_once():
     assert fields["packed_source_sync_wall_max_ms"] == 3.0
     assert fields["packed_source_stream_wait_gpu_ms"] == 4.0
     assert fields["packed_source_stream_wait_gpu_max_ms"] == 2.5
+    assert fields["packed_source_default_stream_wait_count"] == 1
     assert fields["packed_pack_control_other_ms"] == 4.0
     assert worker._transfer_trace_states == {}
+
+
+def test_packed_source_request_state_is_released_after_every_chunk():
+    worker = object.__new__(NixlConnectorWorker)
+    request_key = "decode/req/nonce"
+    first_key = f"{request_key}/0"
+    second_key = f"{request_key}/1"
+    worker._packed_source_slots = {first_key: 3, second_key: 4}
+    worker._packed_source_free_slots = deque()
+    worker._packed_source_requests = {
+        request_key:
+        _PackedSourceRequestState(total_chunks=2, default_stream_ready=True)
+    }
+
+    for key in (first_key, second_key):
+        assert worker._handle_packed_control({
+            "version": 2,
+            "type": "release",
+            "key": key,
+        }) is None
+
+    assert list(worker._packed_source_free_slots) == [3, 4]
+    assert worker._packed_source_requests == {}
+
+
+def test_packed_source_waits_for_default_stream_once_per_request():
+    worker = object.__new__(NixlConnectorWorker)
+    worker._packed_available = True
+    worker._packed_source_slots = {}
+    worker._packed_source_free_slots = deque((3, 4))
+    worker._packed_source_requests = {}
+    worker._packed_blocks_per_slot = 1
+    worker.num_blocks = 2
+    worker._packed_staging = MagicMock()
+    worker._packed_staging.device = "cuda"
+    worker._packed_region_ptrs = MagicMock()
+    worker._packed_pack_stream = MagicMock()
+    worker._pd_trace_enabled = False
+    event = MagicMock()
+    event.elapsed_time.return_value = 0.0
+    module = "vllm.distributed.kv_transfer.kv_connector.v1.nixl_connector"
+
+    with patch(f"{module}.torch.cuda.Event", return_value=event), \
+            patch(f"{module}.torch.cuda.device",
+                  return_value=contextlib.nullcontext()), \
+            patch(f"{module}.torch.cuda.stream",
+                  return_value=contextlib.nullcontext()), \
+            patch(f"{module}.torch.cuda.default_stream"), \
+            patch(f"{module}.torch.tensor"), \
+            patch(f"{module}._launch_pack_regions"):
+        responses = [
+            worker._handle_packed_control({
+                "version": 2,
+                "type": "pack",
+                "key": f"decode/req/nonce/{chunk_id}",
+                "total_chunks": 2,
+                "block_ids": [chunk_id],
+            }) for chunk_id in range(2)
+        ]
+
+    assert [
+        response["source_default_stream_wait_count"] for response in responses
+    ] == [1, 0]
+    worker._packed_pack_stream.wait_stream.assert_called_once()
+    assert worker._packed_source_requests[
+        "decode/req/nonce"].default_stream_ready is True
 
 
 @patch(

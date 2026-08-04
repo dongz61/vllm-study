@@ -85,7 +85,10 @@ CUDA synchronization, and `packed_source_stream_wait_gpu_ms` measures the GPU
 timeline spent waiting for the Prefill default stream. The corresponding
 `*_max_ms` fields expose a single slow chunk, while
 `packed_pack_control_other_ms` retains transport, queueing, and Decode polling
-time not accounted for by the source handler.
+time not accounted for by the source handler. The source establishes the
+default-stream dependency once per request rather than once per chunk;
+`packed_source_default_stream_wait_count` verifies that this count stays at one
+for a completed packed request.
 
 When detailed PD tracing is enabled, the connector also estimates the remaining
 pair-preserving reorder opportunity without changing the submitted descriptors:
