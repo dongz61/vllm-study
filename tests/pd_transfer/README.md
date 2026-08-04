@@ -69,10 +69,11 @@ NIXL_PACKED_STAGING_SLOTS=64
 NIXL_PACKED_AUTO_RANGE_THRESHOLD=64
 ```
 
-The conservative auto rule chooses packed only when `K >= 64`; block count no
-longer provides an independent packed fallback. The range threshold comes from
-the standalone wall-time cuts and remains configurable. Both Prefill and Decode
-receive the same staging and selector settings from the runner.
+The conservative auto rule chooses packed only when `K >= 64` and the Decode
+worker has at least one free local staging slot; block count no longer provides
+an independent packed fallback. The range threshold comes from the standalone
+wall-time cuts and remains configurable. Both Prefill and Decode receive the
+same staging and selector settings from the runner.
 The resolved mode and staging parameters are written to
 `experiment_config.json`, while detailed traces record the selected path and
 the exact `B` and `K` for every transfer.

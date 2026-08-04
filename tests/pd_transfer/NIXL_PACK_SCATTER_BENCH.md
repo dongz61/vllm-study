@@ -242,7 +242,8 @@ Set `nixl_transfer_mode` to:
 - `packed` to force every supported non-empty transfer through GPU gather,
   contiguous READ, and GPU scatter.
 - `auto` to select packed only when the exact paired forward range count `K`
-  reaches `nixl_packed_auto_range_threshold`.
+  reaches `nixl_packed_auto_range_threshold` and the Decode worker has a free
+  local staging slot. Otherwise it immediately uses direct READ.
 
 Use `kv_producer` on Prefill and `kv_consumer` on Decode, and supply the same
 packed configuration to both. The initial integration supports CUDA VRAM,
@@ -264,6 +265,7 @@ integral-block rounding. Leave at least 4 GiB of headroom in
 
 PD traces include `configured_transfer_mode`, `selected_transfer_path`, the
 selector's exact `selector_num_blocks` and `selector_forward_ranges`, packed
-chunk count, pack-control time, pack GPU time, and scatter GPU time. The auto
+slot availability at selection, chunk count, pack-control time, pack GPU time,
+and scatter GPU time. The auto
 range threshold is intentionally configurable because it comes from a
 one-dimensional microbenchmark cut and must be validated with end-to-end runs.

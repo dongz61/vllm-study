@@ -142,7 +142,8 @@ class _PackedRequestState:
 
 
 def _should_use_packed_path(mode: str, num_blocks: int, forward_ranges: int,
-                            auto_range_threshold: int) -> bool:
+                            auto_range_threshold: int,
+                            available_packed_slots: int) -> bool:
     """Select the experimental transfer path from exact request geometry."""
     if mode not in _NIXL_TRANSFER_MODES:
         raise ValueError(f"unsupported NIXL transfer mode: {mode}")
@@ -150,7 +151,8 @@ def _should_use_packed_path(mode: str, num_blocks: int, forward_ranges: int,
         return False
     if mode == "packed":
         return True
-    return forward_ranges >= auto_range_threshold
+    return (forward_ranges >= auto_range_threshold
+            and available_packed_slots > 0)
 
 
 _PACK_TRITON_KERNELS: Optional[tuple[Any, Any, Any]] = None
@@ -502,6 +504,7 @@ class _NixlTransferTraceState:
     selected_transfer_path: str = "direct"
     selector_num_blocks: int = 0
     selector_forward_ranges: int = 0
+    selector_available_packed_slots: int = 0
     auto_range_threshold: int = 64
     packed_chunk_count: int = 0
     packed_pack_control_total_ns: int = 0
@@ -2090,6 +2093,8 @@ class NixlConnectorWorker:
             selected_transfer_path=state.selected_transfer_path,
             selector_num_blocks=state.selector_num_blocks,
             selector_forward_ranges=state.selector_forward_ranges,
+            selector_available_packed_slots=(
+                state.selector_available_packed_slots),
             auto_range_threshold=state.auto_range_threshold,
             packed_chunk_count=state.packed_chunk_count,
             packed_pack_control_ms=round(
@@ -2756,9 +2761,12 @@ class NixlConnectorWorker:
         if configured_mode != "direct" or self._pd_trace_enabled:
             forward_ranges = _count_forward_ranges(submitted_local_block_ids,
                                                    submitted_remote_block_ids)
+        available_packed_slots = len(
+            getattr(self, "_packed_local_free_slots", ()))
         wants_packed = _should_use_packed_path(
             configured_mode, num_local_blocks, forward_ranges,
-            getattr(self, "_packed_auto_range_threshold", 64))
+            getattr(self, "_packed_auto_range_threshold", 64),
+            available_packed_slots)
         packed_supported = (getattr(self, "_packed_available", False)
                             and not self.block_window_per_layer and
                             dst_engine_id in self._packed_dst_xfer_side_handles
@@ -2775,6 +2783,7 @@ class NixlConnectorWorker:
             selected_path=selected_path,
             num_blocks=num_local_blocks,
             forward_ranges=forward_ranges,
+            available_packed_slots=available_packed_slots,
             auto_range_threshold=getattr(self, "_packed_auto_range_threshold",
                                          64),
             packed_supported=packed_supported)
@@ -2791,6 +2800,8 @@ class NixlConnectorWorker:
                     trace_state.selected_transfer_path = selected_path
                     trace_state.selector_num_blocks = num_local_blocks
                     trace_state.selector_forward_ranges = forward_ranges
+                    trace_state.selector_available_packed_slots = (
+                        available_packed_slots)
 
         if selected_path == "packed":
             assert remote_host is not None

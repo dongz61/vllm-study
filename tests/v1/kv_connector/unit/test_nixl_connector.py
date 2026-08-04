@@ -1017,29 +1017,33 @@ def test_analyze_block_pairs_rejects_mismatched_counts():
 
 
 @pytest.mark.parametrize(
-    "mode,num_blocks,forward_ranges,expected",
+    "mode,num_blocks,forward_ranges,available_slots,expected",
     [
-        ("direct", 1, 1, False),
-        ("direct", 512, 512, False),
-        ("packed", 1, 1, True),
-        ("packed", 512, 1, True),
-        ("auto", 32, 1, False),
-        ("auto", 512, 63, False),
-        ("auto", 512, 64, True),
-        ("auto", 2400, 64, True),
-        ("auto", 0, 0, False),
+        ("direct", 1, 1, 64, False),
+        ("direct", 512, 512, 64, False),
+        ("packed", 1, 1, 0, True),
+        ("packed", 512, 1, 0, True),
+        ("auto", 32, 1, 64, False),
+        ("auto", 512, 63, 64, False),
+        ("auto", 512, 64, 1, True),
+        ("auto", 512, 64, 0, False),
+        ("auto", 2400, 64, 64, True),
+        ("auto", 0, 0, 64, False),
     ],
 )
-def test_packed_path_selector(mode, num_blocks, forward_ranges, expected):
+def test_packed_path_selector(mode, num_blocks, forward_ranges,
+                              available_slots, expected):
     assert _should_use_packed_path(mode,
                                    num_blocks,
                                    forward_ranges,
-                                   auto_range_threshold=64) is expected
+                                   auto_range_threshold=64,
+                                   available_packed_slots=(
+                                       available_slots)) is expected
 
 
 def test_packed_path_selector_rejects_unknown_mode():
     with pytest.raises(ValueError, match="unsupported"):
-        _should_use_packed_path("unknown", 1, 1, 64)
+        _should_use_packed_path("unknown", 1, 1, 64, 1)
 
 
 @pytest.mark.parametrize(
