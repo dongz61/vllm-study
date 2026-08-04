@@ -142,8 +142,7 @@ class _PackedRequestState:
 
 
 def _should_use_packed_path(mode: str, num_blocks: int, forward_ranges: int,
-                            auto_range_threshold: int,
-                            auto_block_threshold: int) -> bool:
+                            auto_range_threshold: int) -> bool:
     """Select the experimental transfer path from exact request geometry."""
     if mode not in _NIXL_TRANSFER_MODES:
         raise ValueError(f"unsupported NIXL transfer mode: {mode}")
@@ -151,9 +150,7 @@ def _should_use_packed_path(mode: str, num_blocks: int, forward_ranges: int,
         return False
     if mode == "packed":
         return True
-    if forward_ranges >= auto_range_threshold:
-        return True
-    return num_blocks <= auto_block_threshold
+    return forward_ranges >= auto_range_threshold
 
 
 _PACK_TRITON_KERNELS: Optional[tuple[Any, Any, Any]] = None
@@ -505,8 +502,7 @@ class _NixlTransferTraceState:
     selected_transfer_path: str = "direct"
     selector_num_blocks: int = 0
     selector_forward_ranges: int = 0
-    auto_range_threshold: int = 16
-    auto_block_threshold: int = 32
+    auto_range_threshold: int = 64
     packed_chunk_count: int = 0
     packed_pack_control_total_ns: int = 0
     packed_pack_gpu_total_ns: int = 0
@@ -920,17 +916,14 @@ class NixlConnectorWorker:
         self._packed_staging_mib = positive_int_config(
             "nixl_packed_staging_mib", 64)
         self._packed_staging_slots = positive_int_config(
-            "nixl_packed_staging_slots", 2)
+            "nixl_packed_staging_slots", 64)
         self._packed_auto_range_threshold = positive_int_config(
-            "nixl_packed_auto_range_threshold", 16)
-        self._packed_auto_block_threshold = positive_int_config(
-            "nixl_packed_auto_block_threshold", 32)
+            "nixl_packed_auto_range_threshold", 64)
         logger.info(
             "NIXL transfer mode=%s, packed staging=%s MiB x %s slots, "
-            "auto range threshold=%s, auto block threshold=%s",
+            "auto range threshold=%s",
             self._nixl_transfer_mode, self._packed_staging_mib,
-            self._packed_staging_slots, self._packed_auto_range_threshold,
-            self._packed_auto_block_threshold)
+            self._packed_staging_slots, self._packed_auto_range_threshold)
         canonicalize_reverse_block_pairs = (
             vllm_config.kv_transfer_config.get_from_extra_config(
                 "canonicalize_reverse_block_pairs", False))
@@ -1890,8 +1883,6 @@ class NixlConnectorWorker:
                         configured_transfer_mode=self._nixl_transfer_mode,
                         auto_range_threshold=(
                             self._packed_auto_range_threshold),
-                        auto_block_threshold=(
-                            self._packed_auto_block_threshold),
                         reverse_block_pair_canonicalization_enabled=(
                             self._canonicalize_reverse_block_pairs),
                     )
@@ -2100,7 +2091,6 @@ class NixlConnectorWorker:
             selector_num_blocks=state.selector_num_blocks,
             selector_forward_ranges=state.selector_forward_ranges,
             auto_range_threshold=state.auto_range_threshold,
-            auto_block_threshold=state.auto_block_threshold,
             packed_chunk_count=state.packed_chunk_count,
             packed_pack_control_ms=round(
                 state.packed_pack_control_total_ns / 1_000_000, 6),
@@ -2768,8 +2758,7 @@ class NixlConnectorWorker:
                                                    submitted_remote_block_ids)
         wants_packed = _should_use_packed_path(
             configured_mode, num_local_blocks, forward_ranges,
-            getattr(self, "_packed_auto_range_threshold", 16),
-            getattr(self, "_packed_auto_block_threshold", 32))
+            getattr(self, "_packed_auto_range_threshold", 64))
         packed_supported = (getattr(self, "_packed_available", False)
                             and not self.block_window_per_layer and
                             dst_engine_id in self._packed_dst_xfer_side_handles
@@ -2787,9 +2776,7 @@ class NixlConnectorWorker:
             num_blocks=num_local_blocks,
             forward_ranges=forward_ranges,
             auto_range_threshold=getattr(self, "_packed_auto_range_threshold",
-                                         16),
-            auto_block_threshold=getattr(self, "_packed_auto_block_threshold",
-                                         32),
+                                         64),
             packed_supported=packed_supported)
         if wants_packed and not packed_supported:
             logger.warning_once(

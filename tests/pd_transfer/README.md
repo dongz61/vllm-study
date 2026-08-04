@@ -65,15 +65,14 @@ Set one of these values in `config.env`. Packed and auto modes also accept:
 
 ```bash
 NIXL_PACKED_STAGING_MIB=64
-NIXL_PACKED_STAGING_SLOTS=2
-NIXL_PACKED_AUTO_RANGE_THRESHOLD=16
-NIXL_PACKED_AUTO_BLOCK_THRESHOLD=32
+NIXL_PACKED_STAGING_SLOTS=64
+NIXL_PACKED_AUTO_RANGE_THRESHOLD=64
 ```
 
-The initial auto rule first chooses packed when `K >= 16`. Below that range
-threshold, it chooses packed only for small requests with `B <= 32`. Both
-thresholds come from the standalone wall-time cuts and remain independently
-configurable. Both Prefill and Decode receive the same settings from the runner.
+The conservative auto rule chooses packed only when `K >= 64`; block count no
+longer provides an independent packed fallback. The range threshold comes from
+the standalone wall-time cuts and remains configurable. Both Prefill and Decode
+receive the same staging and selector settings from the runner.
 The resolved mode and staging parameters are written to
 `experiment_config.json`, while detailed traces record the selected path and
 the exact `B` and `K` for every transfer.

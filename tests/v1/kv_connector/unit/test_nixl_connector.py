@@ -1023,11 +1023,10 @@ def test_analyze_block_pairs_rejects_mismatched_counts():
         ("direct", 512, 512, False),
         ("packed", 1, 1, True),
         ("packed", 512, 1, True),
-        ("auto", 32, 1, True),
-        ("auto", 33, 1, False),
-        ("auto", 512, 15, False),
-        ("auto", 512, 16, True),
-        ("auto", 2400, 16, True),
+        ("auto", 32, 1, False),
+        ("auto", 512, 63, False),
+        ("auto", 512, 64, True),
+        ("auto", 2400, 64, True),
         ("auto", 0, 0, False),
     ],
 )
@@ -1035,13 +1034,12 @@ def test_packed_path_selector(mode, num_blocks, forward_ranges, expected):
     assert _should_use_packed_path(mode,
                                    num_blocks,
                                    forward_ranges,
-                                   auto_range_threshold=16,
-                                   auto_block_threshold=32) is expected
+                                   auto_range_threshold=64) is expected
 
 
 def test_packed_path_selector_rejects_unknown_mode():
     with pytest.raises(ValueError, match="unsupported"):
-        _should_use_packed_path("unknown", 1, 1, 16, 32)
+        _should_use_packed_path("unknown", 1, 1, 64)
 
 
 @pytest.mark.parametrize(

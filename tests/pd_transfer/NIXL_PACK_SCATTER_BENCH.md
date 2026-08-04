@@ -229,9 +229,8 @@ The NIXL connector can run the production pull path in three modes through
   "kv_connector_extra_config": {
     "nixl_transfer_mode": "direct",
     "nixl_packed_staging_mib": 64,
-    "nixl_packed_staging_slots": 2,
-    "nixl_packed_auto_range_threshold": 16,
-    "nixl_packed_auto_block_threshold": 32
+    "nixl_packed_staging_slots": 64,
+    "nixl_packed_auto_range_threshold": 64
   }
 }
 ```
@@ -242,10 +241,8 @@ Set `nixl_transfer_mode` to:
   the default.
 - `packed` to force every supported non-empty transfer through GPU gather,
   contiguous READ, and GPU scatter.
-- `auto` to use the exact block count `B` and paired forward range count `K`.
-  It first selects packed when
-  `K >= nixl_packed_auto_range_threshold`; below that threshold it selects
-  packed only when `B <= nixl_packed_auto_block_threshold`.
+- `auto` to select packed only when the exact paired forward range count `K`
+  reaches `nixl_packed_auto_range_threshold`.
 
 Use `kv_producer` on Prefill and `kv_consumer` on Decode, and supply the same
 packed configuration to both. The initial integration supports CUDA VRAM,
@@ -261,12 +258,12 @@ remote slot, and the request is reported complete only after the destination
 scatter CUDA event completes.
 
 Staging is allocated after the KV cache. With the Qwen3-8B geometry used by the
-microbenchmark, two nominal 64 MiB slots consume about 126 MiB per GPU after
-integral-block rounding. Leave at least this much headroom in
+microbenchmark, 64 nominal 64 MiB slots consume about 4032 MiB per GPU after
+integral-block rounding. Leave at least 4 GiB of headroom in
 `--gpu-memory-utilization` for packed and auto runs.
 
 PD traces include `configured_transfer_mode`, `selected_transfer_path`, the
 selector's exact `selector_num_blocks` and `selector_forward_ranges`, packed
 chunk count, pack-control time, pack GPU time, and scatter GPU time. The auto
-thresholds are intentionally configurable because they come from two
-one-dimensional microbenchmark cuts and must be validated with end-to-end runs.
+range threshold is intentionally configurable because it comes from a
+one-dimensional microbenchmark cut and must be validated with end-to-end runs.
