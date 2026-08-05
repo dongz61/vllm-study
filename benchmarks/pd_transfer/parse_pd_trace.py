@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 from uuid import UUID
 
+_ENGINE_SUFFIX = re.compile(r"-\d+-[0-9a-fA-F]{8}$")
 _TP_SUFFIX = re.compile(r"-\d+$")
 
 
@@ -23,6 +24,7 @@ def normalize_request_id(value: Any) -> str:
     try:
         UUID(request_id)
     except ValueError:
+        request_id = _ENGINE_SUFFIX.sub("", request_id)
         return _TP_SUFFIX.sub("", request_id)
     return request_id
 
