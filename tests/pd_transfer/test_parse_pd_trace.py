@@ -9,7 +9,7 @@ from tests.pd_transfer.parse_pd_trace import (build_timelines,
 
 
 def test_transfer_profile_is_merged_into_request_timeline(tmp_path):
-    request_id = "b585ea4b-9c9b-435b-a090-508219653957"
+    request_id = "case-8k-c1-7-pdreq"
     records = [
         {
             "event": "proxy_request_received",
@@ -26,7 +26,13 @@ def test_transfer_profile_is_merged_into_request_timeline(tmp_path):
             "request_id": f"cmpl-{request_id}-0",
             "perf_ns": 9_000_000,
             "kv_load_start_perf_ns": 2_000_000,
+            "xfer_prepare_start_perf_ns": 3_000_000,
+            "xfer_prepare_end_perf_ns": 4_000_000,
+            "xfer_submit_start_perf_ns": 3_500_000,
+            "xfer_submit_end_perf_ns": 5_000_000,
+            "xfer_done_observed_perf_ns": 7_000_000,
             "connector_finished_perf_ns": 8_000_000,
+            "kv_load_to_connector_finished_ms": 6.0,
             "desc_build_ms": 0.25,
             "submit_to_done_observed_ms": 4.5,
             "total_bytes": 8192,
@@ -74,6 +80,12 @@ def test_transfer_profile_is_merged_into_request_timeline(tmp_path):
             "output_len": 1,
             "concurrency": 1,
             "num_prompts": 20,
+            "dataset": "mooncake-conversation",
+            "phase": "diagnostic",
+            "variant": "on",
+            "repetition": 2,
+            "request_rate": "0.16",
+            "injected_transfer_delay_ms": 0,
         },
         {
             "event": "bench_case_end",
@@ -109,12 +121,25 @@ def test_transfer_profile_is_merged_into_request_timeline(tmp_path):
     assert row["canonicalized_reverse_run_count"] == 2
     assert row["canonicalized_reverse_block_count"] == 16
     assert row["case_id"] == "case-8k-c1"
+    assert row["case_request_index"] == 7
     assert row["input_len"] == 8192
     assert row["concurrency"] == 1
+    assert row["workload"] == "mooncake-conversation"
+    assert row["phase"] == "diagnostic"
+    assert row["variant"] == "on"
+    assert row["repetition"] == 2
+    assert row["configured_request_rate"] == "0.16"
+    assert row["injected_transfer_delay_ms"] == 0
     assert row["kv_alloc_to_load_ms"] == 1.0
     assert row["kv_load_to_remote_ready_ms"] == 8.0
     assert row["connector_finished_to_remote_ready_ms"] == 2.0
     assert row["remote_ready_to_schedulable_ms"] == 1.0
+    assert row["transfer_before_issue_ms"] == 1.0
+    assert row["transfer_issue_span_ms"] == 2.0
+    assert row["transfer_post_issue_wait_ms"] == 2.0
+    assert row["transfer_connector_finalize_ms"] == 1.0
+    assert row["transfer_accounted_wall_ms"] == 6.0
+    assert row["transfer_critical_path_residual_ms"] == 0.0
 
 
 @pytest.mark.parametrize(

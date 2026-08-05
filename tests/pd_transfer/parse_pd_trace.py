@@ -176,6 +176,16 @@ def parse_case_intervals(root: Path) -> list[dict[str, Any]]:
                         "output_len": start.get("output_len", ""),
                         "concurrency": start.get("concurrency", ""),
                         "num_prompts": start.get("num_prompts", ""),
+                        "workload": start.get("dataset", ""),
+                        "phase": start.get("phase", ""),
+                        "variant": start.get("variant", ""),
+                        "repetition": start.get("repetition", ""),
+                        "configured_request_rate": start.get(
+                            "request_rate",
+                            start.get("configured_request_rate", ""),
+                        ),
+                        "injected_transfer_delay_ms": start.get(
+                            "injected_transfer_delay_ms", ""),
                     })
     intervals.sort(key=lambda interval: interval["start_ns"])
     return intervals
@@ -251,9 +261,29 @@ def build_timelines(root: Path) -> list[dict[str, Any]]:
                          if interval["start_ns"] <= first_ts_ns <=
                          interval["end_ns"]), None)
             if case is not None:
-                for field in ("case_id", "mode", "sleep_ms", "input_len",
-                              "output_len", "concurrency", "num_prompts"):
+                for field in (
+                    "case_id",
+                    "mode",
+                    "sleep_ms",
+                    "input_len",
+                    "output_len",
+                    "concurrency",
+                    "num_prompts",
+                    "workload",
+                    "phase",
+                    "variant",
+                    "repetition",
+                    "configured_request_rate",
+                    "injected_transfer_delay_ms",
+                ):
                     row[field] = case[field]
+
+                match = re.fullmatch(
+                    rf"{re.escape(str(case['case_id']))}-(\d+)-pdreq",
+                    str(row.get("request_id", "")),
+                )
+                if match is not None:
+                    row["case_request_index"] = int(match.group(1))
 
         def delta(start: str, end: str):
             s = row.get(f"{start}_perf_ns")
@@ -286,6 +316,48 @@ def build_timelines(root: Path) -> list[dict[str, Any]]:
             "pull_prefill_finished", "decode_remote_kv_ready"))
         row["kv_ready_to_first_chunk_ms"] = to_ms(delta(
             "decode_remote_kv_ready", "proxy_first_response_chunk"))
+
+        # The packed path pipelines prepare/submit calls across chunks, so its
+        # per-call timers overlap and must not be stacked.  These four slices
+        # instead use monotonic request landmarks and form a non-overlapping
+        # decomposition of kv_load_start -> connector_finished.
+        issue_starts = [
+            value for event in ("xfer_prepare_start", "xfer_submit_start")
+            if (value := row.get(f"{event}_perf_ns")) is not None
+        ]
+        issue_ends = [
+            value for event in ("xfer_prepare_end", "xfer_submit_end")
+            if (value := row.get(f"{event}_perf_ns")) is not None
+        ]
+        kv_load_start = row.get("kv_load_start_perf_ns")
+        done_observed = row.get("xfer_done_observed_perf_ns")
+        connector_finished = row.get("connector_finished_perf_ns")
+        if (kv_load_start is not None and issue_starts and issue_ends
+                and done_observed is not None
+                and connector_finished is not None):
+            first_issue = min(issue_starts)
+            last_issue = max(issue_ends)
+            slices_ns = (
+                first_issue - kv_load_start,
+                last_issue - first_issue,
+                done_observed - last_issue,
+                connector_finished - done_observed,
+            )
+            if all(value >= 0 for value in slices_ns):
+                fields = (
+                    "transfer_before_issue_ms",
+                    "transfer_issue_span_ms",
+                    "transfer_post_issue_wait_ms",
+                    "transfer_connector_finalize_ms",
+                )
+                for field, value in zip(fields, slices_ns):
+                    row[field] = to_ms(value)
+                row["transfer_accounted_wall_ms"] = to_ms(sum(slices_ns))
+                visible_wall = as_float(
+                    row.get("kv_load_to_connector_finished_ms"))
+                if visible_wall != "":
+                    row["transfer_critical_path_residual_ms"] = round(
+                        visible_wall - sum(slices_ns) / 1_000_000, 6)
         rows.append(row)
     rows.sort(key=lambda r: r.get("request_id", ""))
     return rows

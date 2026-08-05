@@ -1,0 +1,23 @@
+FROM verl_base:vllm_v0.11.0
+
+COPY vllm/distributed/kv_transfer/pd_trace.py \
+  /usr/local/lib/python3.12/dist-packages/vllm/distributed/kv_transfer/pd_trace.py
+
+COPY vllm/distributed/kv_transfer/kv_connector/v1/nixl_connector.py \
+  /usr/local/lib/python3.12/dist-packages/vllm/distributed/kv_transfer/kv_connector/v1/nixl_connector.py
+
+COPY vllm/v1/core/sched/scheduler.py \
+  /usr/local/lib/python3.12/dist-packages/vllm/v1/core/sched/scheduler.py
+
+COPY tests/pd_transfer /workspace/vllm-study/tests/pd_transfer
+
+COPY vllm/benchmarks/datasets.py \
+  /usr/local/lib/python3.12/dist-packages/vllm/benchmarks/datasets.py
+
+COPY vllm/benchmarks/serve.py \
+  /usr/local/lib/python3.12/dist-packages/vllm/benchmarks/serve.py
+
+RUN grep -q "def _emit_transfer_trace" \
+  /usr/local/lib/python3.12/dist-packages/vllm/distributed/kv_transfer/kv_connector/v1/nixl_connector.py
+
+WORKDIR /workspace/vllm-study
