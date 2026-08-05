@@ -47,6 +47,14 @@ NIXL_PACKED_STAGING_SLOTS=${NIXL_PACKED_STAGING_SLOTS:-64}
 PREFILL_PACKED_STAGING_SLOTS=${PREFILL_PACKED_STAGING_SLOTS:-${NIXL_PACKED_STAGING_SLOTS}}
 DECODE_PACKED_STAGING_SLOTS=${DECODE_PACKED_STAGING_SLOTS:-${NIXL_PACKED_STAGING_SLOTS}}
 NIXL_PACKED_AUTO_RANGE_THRESHOLD=${NIXL_PACKED_AUTO_RANGE_THRESHOLD:-64}
+# Optional P-only CPU KV cache. When enabled, the Prefill server uses a
+# MultiConnector containing NixlConnector and OffloadingConnector; Decode stays
+# on the plain NixlConnector path so CPU-cache traffic cannot hide D-side NIXL
+# transfer behavior. Offloaded block size is measured in tokens and must be a
+# multiple of the engine's GPU KV-cache block size.
+PREFILL_CPU_KV_OFFLOAD=${PREFILL_CPU_KV_OFFLOAD:-0}
+PREFILL_CPU_KV_BLOCK_SIZE=${PREFILL_CPU_KV_BLOCK_SIZE:-512}
+PREFILL_CPU_KV_NUM_BLOCKS=${PREFILL_CPU_KV_NUM_BLOCKS:-0}
 
 require_value() {
   local name=$1
@@ -274,6 +282,18 @@ for packed_integer_name in NIXL_PACKED_STAGING_MIB \
   DECODE_PACKED_STAGING_SLOTS NIXL_PACKED_AUTO_RANGE_THRESHOLD; do
   require_positive_integer "${packed_integer_name}"
 done
+case "${PREFILL_CPU_KV_OFFLOAD}" in
+  0)
+    ;;
+  1)
+    require_positive_integer PREFILL_CPU_KV_BLOCK_SIZE
+    require_positive_integer PREFILL_CPU_KV_NUM_BLOCKS
+    ;;
+  *)
+    echo "PREFILL_CPU_KV_OFFLOAD must be 0 or 1; got: ${PREFILL_CPU_KV_OFFLOAD}" >&2
+    exit 1
+    ;;
+esac
 
 read -r -a TRANSFER_DELAY_VALUES <<< "${TRANSFER_DELAY_MS_LIST}"
 if (( ${#TRANSFER_DELAY_VALUES[@]} == 0 )); then
@@ -441,7 +461,10 @@ python3 - \
   "${TRANSFER_MODE_B}" \
   "${REVERSE_VARIANT}" \
   "${PREFILL_PACKED_STAGING_SLOTS}" \
-  "${DECODE_PACKED_STAGING_SLOTS}" <<'PY'
+  "${DECODE_PACKED_STAGING_SLOTS}" \
+  "${PREFILL_CPU_KV_OFFLOAD}" \
+  "${PREFILL_CPU_KV_BLOCK_SIZE}" \
+  "${PREFILL_CPU_KV_NUM_BLOCKS}" <<'PY'
 import json
 import sys
 from datetime import datetime, timezone
@@ -455,7 +478,9 @@ from pathlib import Path
  packed_staging_mib, packed_staging_slots,
  packed_auto_range_threshold, paired_axis, transfer_mode_a,
  transfer_mode_b, reverse_variant, prefill_packed_staging_slots,
- decode_packed_staging_slots) = sys.argv[1:]
+ decode_packed_staging_slots, prefill_cpu_kv_offload,
+ prefill_cpu_kv_block_size, prefill_cpu_kv_num_blocks) = sys.argv[1:]
+cpu_kv_offload_enabled = prefill_cpu_kv_offload == "1"
 manifest = {
     "created_at": datetime.now(timezone.utc).isoformat(),
     "workload": workload_name,
@@ -501,6 +526,18 @@ manifest = {
     "prefill_packed_staging_slots": int(prefill_packed_staging_slots),
     "decode_packed_staging_slots": int(decode_packed_staging_slots),
     "nixl_packed_auto_range_threshold": int(packed_auto_range_threshold),
+    "prefill_cpu_kv_offload": cpu_kv_offload_enabled,
+    "prefill_cpu_kv_block_size": (
+        int(prefill_cpu_kv_block_size) if cpu_kv_offload_enabled else None
+    ),
+    "prefill_cpu_kv_num_blocks": (
+        int(prefill_cpu_kv_num_blocks) if cpu_kv_offload_enabled else None
+    ),
+    "prefill_kv_connector": (
+        "MultiConnector(NixlConnector,OffloadingConnector)"
+        if cpu_kv_offload_enabled else "NixlConnector"
+    ),
+    "decode_kv_connector": "NixlConnector",
     "variant_order": (
         "odd repetitions: off,on; even repetitions: on,off"
         if variant_mode == "paired" else variant_mode
@@ -696,8 +733,16 @@ kv_config() {
   else
     staging_slots="${DECODE_PACKED_STAGING_SLOTS}"
   fi
-  printf '%s\n' \
-    "{\"kv_connector\":\"NixlConnector\",\"kv_role\":\"${role}\",\"engine_id\":\"${engine_id}\",\"kv_connector_extra_config\":{\"canonicalize_reverse_block_pairs\":${enabled},\"nixl_transfer_mode\":\"${transfer_mode}\",\"nixl_packed_staging_mib\":${NIXL_PACKED_STAGING_MIB},\"nixl_packed_staging_slots\":${staging_slots},\"nixl_packed_auto_range_threshold\":${NIXL_PACKED_AUTO_RANGE_THRESHOLD}}}"
+  if [[ "${role}" == "kv_producer" \
+        && "${PREFILL_CPU_KV_OFFLOAD}" == "1" ]]; then
+    # Inner connectors omit engine_id so MultiConnector inherits the outer
+    # Prefill engine ID without passing the keyword twice.
+    printf '%s\n' \
+      "{\"kv_connector\":\"MultiConnector\",\"kv_role\":\"kv_producer\",\"engine_id\":\"${engine_id}\",\"kv_connector_extra_config\":{\"connectors\":[{\"kv_connector\":\"NixlConnector\",\"kv_role\":\"kv_producer\",\"kv_connector_extra_config\":{\"canonicalize_reverse_block_pairs\":${enabled},\"nixl_transfer_mode\":\"${transfer_mode}\",\"nixl_packed_staging_mib\":${NIXL_PACKED_STAGING_MIB},\"nixl_packed_staging_slots\":${staging_slots},\"nixl_packed_auto_range_threshold\":${NIXL_PACKED_AUTO_RANGE_THRESHOLD}}},{\"kv_connector\":\"OffloadingConnector\",\"kv_role\":\"kv_both\",\"kv_connector_extra_config\":{\"block_size\":${PREFILL_CPU_KV_BLOCK_SIZE},\"num_cpu_blocks\":${PREFILL_CPU_KV_NUM_BLOCKS}}}]}}"
+  else
+    printf '%s\n' \
+      "{\"kv_connector\":\"NixlConnector\",\"kv_role\":\"${role}\",\"engine_id\":\"${engine_id}\",\"kv_connector_extra_config\":{\"canonicalize_reverse_block_pairs\":${enabled},\"nixl_transfer_mode\":\"${transfer_mode}\",\"nixl_packed_staging_mib\":${NIXL_PACKED_STAGING_MIB},\"nixl_packed_staging_slots\":${staging_slots},\"nixl_packed_auto_range_threshold\":${NIXL_PACKED_AUTO_RANGE_THRESHOLD}}}"
+  fi
 }
 
 start_vllm_server() {
@@ -980,6 +1025,11 @@ else
 fi
 echo "Packed staging: ${NIXL_PACKED_STAGING_MIB} MiB x slots (P=${PREFILL_PACKED_STAGING_SLOTS}, D=${DECODE_PACKED_STAGING_SLOTS})"
 echo "Packed auto range threshold: ${NIXL_PACKED_AUTO_RANGE_THRESHOLD}"
+if [[ "${PREFILL_CPU_KV_OFFLOAD}" == "1" ]]; then
+  echo "Prefill CPU KV offload: enabled (${PREFILL_CPU_KV_NUM_BLOCKS} x ${PREFILL_CPU_KV_BLOCK_SIZE}-token blocks)"
+else
+  echo "Prefill CPU KV offload: disabled"
+fi
 echo "Transfer delays (ms): ${TRANSFER_DELAY_VALUES[*]}"
 if [[ "${DATASET_LOADER}" == "mooncake" ]]; then
   echo "REQUEST_RATES are interpreted as recorded arrival-rate multipliers."
