@@ -9,6 +9,7 @@ from vllm.distributed.kv_transfer.kv_connector.utils import BlockIds
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_scheduler import (
     NixlBaseConnectorScheduler,
 )
+from vllm.distributed.kv_transfer.pd_trace import trace_event
 from vllm.logger import init_logger
 
 if TYPE_CHECKING:
@@ -261,6 +262,16 @@ class NixlPullConnectorScheduler(NixlBaseConnectorScheduler):
             block_ids = self.get_sw_clipped_blocks(block_ids)
 
             remote_num_tokens = request.num_computed_tokens
+
+            if is_p_node:
+                trace_event(
+                    "prefill_compute_done",
+                    request.request_id,
+                    role="prefill",
+                    num_blocks=sum(len(group) for group in block_ids),
+                    num_tokens=remote_num_tokens,
+                    tp_size=self.vllm_config.parallel_config.tensor_parallel_size,
+                )
 
         return delay_free_blocks, dict(
             do_remote_prefill=is_p_node,

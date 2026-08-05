@@ -79,7 +79,7 @@ class SampleRequest:
     Represents a single inference request for benchmarking.
     """
 
-    prompt: str | list[str] | list[dict]
+    prompt: str | list[int] | list[str] | list[dict]
     prompt_len: int
     expected_output_len: int | None
     multi_modal_data: MultiModalDataDict | dict | list[dict] | None = None
@@ -1454,7 +1454,7 @@ class TimedTrace(BenchmarkDataset):
             f'label_output_length: "{self.label_output_length}", '
             f'label_hash_ids: "{self.label_hash_ids}"'
         )
-        self._expanded_generated_prompts = {}
+        self._expanded_generated_prompts: dict[tuple[int, int], list[int]] = {}
         self.load_data()
 
     def load_data(self) -> None:
@@ -1464,7 +1464,7 @@ class TimedTrace(BenchmarkDataset):
 
         # load and we will do transformation once we have the Tokenizer available
         # this is jsonl data format
-        with open(self.dataset_path) as f:
+        with open(self.dataset_path, encoding="utf-8-sig") as f:
             self.data = f.readlines()
 
     def _sample_token(
@@ -1506,12 +1506,14 @@ class TimedTrace(BenchmarkDataset):
                 else target_input_size
             )
 
-            # Cache key includes size for partial chunks at the end
-            key = f"{h}:{expanded_size}"
+            # Cache key includes size for partial chunks at the end. Avoid
+            # Python's randomized hash() so repeated runs produce the same IDs.
+            key = (int(h), expanded_size)
 
             if key not in self._expanded_generated_prompts:
-                # Convert key to a deterministic seed
-                key_seed = hash(key) & 0xFFFFFFFF  # Convert to 32-bit int
+                key_seed = (
+                    (key[0] * 0x9E3779B1) ^ (key[1] * 0x85EBCA77)
+                ) & 0xFFFFFFFF
                 self._expanded_generated_prompts[key] = self._sample_token(
                     expanded_size, tokenizer, seed=key_seed
                 )
@@ -1534,6 +1536,8 @@ class TimedTrace(BenchmarkDataset):
         samples: list = []
         assert tokenizer is not None, "Tokenizer must be provided, now is Null"
 
+        first_timestamp: float | None = None
+        previous_timestamp: float | None = None
         for ind, entry in enumerate(self.data):
             if len(samples) >= num_requests:
                 break
@@ -1541,27 +1545,35 @@ class TimedTrace(BenchmarkDataset):
             # now we create the SampleRequest with timing info
             entry = json.loads(entry.strip())
             input_length = entry.get(self.label_input_length)
-            if input_length is None:
+            if not isinstance(input_length, int) or input_length <= 0:
                 raise ValueError(
-                    f"Input length field '{self.label_input_length}' "
-                    f"not found in trace entry. "
+                    f"Input length field '{self.label_input_length}' must be "
+                    f"a positive integer. "
                     f"Available fields: {list(entry.keys())}. "
                     f"Use --label-input-length to specify the correct "
                     f"field name."
                 )
             new_output_len = entry.get(self.label_output_length)
-            if new_output_len is None:
+            if not isinstance(new_output_len, int) or new_output_len <= 0:
                 raise ValueError(
-                    f"Output length field '{self.label_output_length}' "
-                    f"not found in trace entry. "
+                    f"Output length field '{self.label_output_length}' must be "
+                    f"a positive integer. "
                     f"Available fields: {list(entry.keys())}. "
                     f"Use --label-output-length to specify the correct "
                     f"field name."
                 )
-            prompt_ids = self._expand_prompt(
-                entry.get(self.label_hash_ids, []), input_length, tokenizer
-            )
-            prompt = tokenizer.decode(prompt_ids)
+            hash_ids = entry.get(self.label_hash_ids)
+            if not isinstance(hash_ids, list) or not hash_ids:
+                raise ValueError(
+                    f"Hash ID field '{self.label_hash_ids}' must be a non-empty list."
+                )
+            expected_chunks = math.ceil(input_length / self.chunk_size)
+            if len(hash_ids) != expected_chunks:
+                raise ValueError(
+                    f"Input length {input_length} requires {expected_chunks} hash "
+                    f"IDs at chunk size {self.chunk_size}, got {len(hash_ids)}."
+                )
+            prompt_ids = self._expand_prompt(hash_ids, input_length, tokenizer)
 
             # Get timestamp with proper error handling
             ts_value = entry.get(self.label_ts)
@@ -1572,18 +1584,26 @@ class TimedTrace(BenchmarkDataset):
                     f"Use --label-timestamp to specify the correct field name."
                 )
             timestamp = float(ts_value) * self.sec_multiplier
+            if not math.isfinite(timestamp) or timestamp < 0:
+                raise ValueError("Trace timestamps must be finite and non-negative.")
+            if previous_timestamp is not None and timestamp < previous_timestamp:
+                raise ValueError("Trace timestamps must be non-decreasing.")
+            previous_timestamp = timestamp
+            if first_timestamp is None:
+                first_timestamp = timestamp
 
             prompt_len = len(prompt_ids)
 
             samples.append(
                 SampleRequest(
-                    prompt=prompt,
+                    prompt=prompt_ids,
                     prompt_len=prompt_len,
                     expected_output_len=new_output_len,
                     lora_request=None,
                     multi_modal_data=None,
                     request_id=request_id_prefix + str(ind),
-                    timestamp=timestamp,
+                    timestamp=timestamp - first_timestamp,
+                    request_overrides={"add_special_tokens": False},
                 )
             )
         return samples

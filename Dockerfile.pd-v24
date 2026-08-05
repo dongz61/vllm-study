@@ -1,0 +1,27 @@
+FROM local/vllm:v0.24.0-cu128-nixl
+
+COPY vllm/distributed/kv_transfer/pd_trace.py \
+  /usr/local/lib/python3.10/dist-packages/vllm/distributed/kv_transfer/pd_trace.py
+COPY vllm/distributed/kv_transfer/kv_connector/v1/nixl/pull_scheduler.py \
+  /usr/local/lib/python3.10/dist-packages/vllm/distributed/kv_transfer/kv_connector/v1/nixl/pull_scheduler.py
+COPY vllm/distributed/kv_transfer/kv_connector/v1/nixl/pull_worker.py \
+  /usr/local/lib/python3.10/dist-packages/vllm/distributed/kv_transfer/kv_connector/v1/nixl/pull_worker.py
+COPY vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py \
+  /usr/local/lib/python3.10/dist-packages/vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py
+COPY vllm/v1/core/sched/scheduler.py \
+  /usr/local/lib/python3.10/dist-packages/vllm/v1/core/sched/scheduler.py
+COPY vllm/benchmarks/datasets/datasets.py \
+  /usr/local/lib/python3.10/dist-packages/vllm/benchmarks/datasets/datasets.py
+COPY vllm/benchmarks/lib/endpoint_request_func.py \
+  /usr/local/lib/python3.10/dist-packages/vllm/benchmarks/lib/endpoint_request_func.py
+
+COPY benchmarks/pd_transfer /opt/pd-transfer
+
+RUN chmod +x /opt/pd-transfer/run_pd_transfer_bench.sh \
+  && python3 -c "from vllm.distributed.kv_transfer.pd_trace import trace_event" \
+  && grep -q 'prefill_compute_done' \
+    /usr/local/lib/python3.10/dist-packages/vllm/distributed/kv_transfer/kv_connector/v1/nixl/pull_scheduler.py \
+  && grep -q 'transfer_reported_done' \
+    /usr/local/lib/python3.10/dist-packages/vllm/v1/core/sched/scheduler.py
+
+WORKDIR /workspace/vllm-study

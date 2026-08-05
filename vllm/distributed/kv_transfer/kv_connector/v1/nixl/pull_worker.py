@@ -17,6 +17,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.tp_mapping import (
     ReadSpec,
 )
+from vllm.distributed.kv_transfer.pd_trace import trace_event
 from vllm.logger import init_logger
 
 if TYPE_CHECKING:
@@ -314,8 +315,25 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
 
             # Use handle to check completion in future step().
             self._recving_transfers[request_id].append(handle)
+            trace_event(
+                "transfer_submit",
+                request_id,
+                role="decode",
+                tp_rank=self.tp_rank,
+                local_tp_size=self.world_size,
+                remote_tp_size=remote_info.remote_tp_size,
+                remote_rank=remote_rank,
+                num_descriptors=len(local_block_descs_ids),
+            )
         except Exception as e:
             # mark all (logical) blocks for this request as invalid
+            trace_event(
+                "transfer_failed",
+                request_id,
+                role="decode",
+                tp_rank=self.tp_rank,
+                error=repr(e),
+            )
             self._log_failure(
                 failure_type="transfer_setup_failed",
                 req_id=request_id,

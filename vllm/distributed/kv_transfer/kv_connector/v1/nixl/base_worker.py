@@ -49,6 +49,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.tp_mapping import (
     _is_ssm_spec,
     compute_tp_mapping,
 )
+from vllm.distributed.kv_transfer.pd_trace import trace_event
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.utils import (
     _NIXL_SUPPORTED_DEVICE,
     get_representative_spec_type,
@@ -2011,6 +2012,7 @@ class NixlBaseConnectorWorker:
         done_req_ids: set[str] = set()
         for req_id, handles in list(transfers.items()):
             in_progress = []
+            failed = False
             for handle in handles:
                 try:
                     xfer_state = self.nixl_wrapper.check_xfer_state(handle)
@@ -2023,6 +2025,14 @@ class NixlBaseConnectorWorker:
                         in_progress.append(handle)
                         continue
                     else:
+                        failed = True
+                        trace_event(
+                            "transfer_failed",
+                            req_id,
+                            role="decode",
+                            tp_rank=self.tp_rank,
+                            xfer_state=xfer_state,
+                        )
                         self._log_failure(
                             failure_type="transfer_failed",
                             msg="Marking blocks as invalid",
@@ -2031,6 +2041,14 @@ class NixlBaseConnectorWorker:
                         )
                         self._handle_failed_transfer(req_id, handle)
                 except Exception as e:
+                    failed = True
+                    trace_event(
+                        "transfer_failed",
+                        req_id,
+                        role="decode",
+                        tp_rank=self.tp_rank,
+                        error=repr(e),
+                    )
                     self._log_failure(
                         failure_type="transfer_exception",
                         msg="Marking blocks as invalid",
@@ -2043,6 +2061,14 @@ class NixlBaseConnectorWorker:
                 # Only report request as completed when all transfers are done.
                 done_req_ids.add(req_id)
                 del transfers[req_id]
+                trace_event(
+                    "transfer_physical_done",
+                    req_id,
+                    role="decode",
+                    tp_rank=self.tp_rank,
+                    local_tp_size=self.world_size,
+                    success=not failed,
+                )
             else:
                 transfers[req_id] = in_progress
         return done_req_ids
