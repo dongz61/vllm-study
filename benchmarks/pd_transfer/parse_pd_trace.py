@@ -70,6 +70,8 @@ def build_rows(root: Path) -> list[dict[str, Any]]:
     grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for record in iter_records(root):
         if request_id := record.get("request_id"):
+            if request_id.startswith("warmup-"):
+                continue
             grouped[request_id].append(record)
 
     rows = []

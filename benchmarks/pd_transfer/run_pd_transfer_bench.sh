@@ -11,6 +11,14 @@ fi
 # shellcheck source=/dev/null
 source "${CONFIG_PATH}"
 
+# Keep existing config.env files working while enabling a representative,
+# content-disjoint warm-up by default.
+WARMUP_PROMPTS=${WARMUP_PROMPTS:-4}
+WARMUP_INPUT_LEN=${WARMUP_INPUT_LEN:-4096}
+WARMUP_OUTPUT_LEN=${WARMUP_OUTPUT_LEN:-16}
+WARMUP_CONCURRENCY=${WARMUP_CONCURRENCY:-1}
+WARMUP_SEED=${WARMUP_SEED:-900000}
+
 PIDS=()
 
 kill_tree() {
@@ -45,6 +53,14 @@ require_positive_integer() {
   fi
 }
 
+require_nonnegative_integer() {
+  local name=$1 value=${!1}
+  if [[ ! "${value}" =~ ^[0-9]+$ ]]; then
+    echo "${name} must be a non-negative integer, got ${value}" >&2
+    exit 1
+  fi
+}
+
 validate_devices() {
   local role=$1 devices=$2 tp_size=$3
   local -a device_array
@@ -62,6 +78,17 @@ validate_config() {
     MOONCAKE_BLOCK_SIZE; do
     require_positive_integer "${name}"
   done
+  require_nonnegative_integer WARMUP_PROMPTS
+  if (( WARMUP_PROMPTS > 0 )); then
+    for name in WARMUP_INPUT_LEN WARMUP_OUTPUT_LEN WARMUP_CONCURRENCY; do
+      require_positive_integer "${name}"
+    done
+    require_nonnegative_integer WARMUP_SEED
+    if (( WARMUP_INPUT_LEN + WARMUP_OUTPUT_LEN > MAX_MODEL_LEN )); then
+      echo "Warm-up input + output length exceeds MAX_MODEL_LEN" >&2
+      exit 1
+    fi
+  fi
   validate_devices "prefill" "${PREFILL_DEVICES}" "${PREFILL_TP_SIZE}"
   validate_devices "decode" "${DECODE_DEVICES}" "${DECODE_TP_SIZE}"
   if (( PREFILL_TP_SIZE % DECODE_TP_SIZE != 0 \
@@ -197,6 +224,40 @@ start_proxy() {
   PIDS+=("$!")
 }
 
+run_warmup() {
+  local run_root=$1 run_id=$2
+
+  if (( WARMUP_PROMPTS == 0 )); then
+    echo "Warm-up disabled"
+    return 0
+  fi
+
+  printf 'Warm-up: prompts=%s, input=%s, output=%s, concurrency=%s\n' \
+    "${WARMUP_PROMPTS}" "${WARMUP_INPUT_LEN}" \
+    "${WARMUP_OUTPUT_LEN}" "${WARMUP_CONCURRENCY}"
+  # Random inputs are deliberately separate from the formal TimedTrace
+  # workload, so warm-up cannot create prefix hits in the measured requests.
+  # shellcheck disable=SC2086
+  vllm bench serve \
+    --backend vllm \
+    --model "${SERVED_MODEL_NAME}" \
+    --tokenizer "${BENCH_TOKENIZER:-${MODEL}}" \
+    --host "${HOST}" \
+    --port "${PROXY_PORT}" \
+    --dataset-name random \
+    --random-input-len "${WARMUP_INPUT_LEN}" \
+    --random-output-len "${WARMUP_OUTPUT_LEN}" \
+    --num-prompts "${WARMUP_PROMPTS}" \
+    --max-concurrency "${WARMUP_CONCURRENCY}" \
+    --request-rate inf \
+    --ignore-eos \
+    --seed "${WARMUP_SEED}" \
+    --temperature 0 \
+    --ready-check-timeout-sec 0 \
+    --request-id-prefix "warmup-${run_id}-" \
+    ${WARMUP_EXTRA_ARGS:-} 2>&1 | tee "${run_root}/warmup.log"
+}
+
 validate_config
 check_ports
 
@@ -210,6 +271,12 @@ printf '{"run_id":"%s","prefill_tp_size":%s,"decode_tp_size":%s,' \
   >"${RUN_ROOT}/run_manifest.json"
 printf '"prefill_devices":"%s","decode_devices":"%s",' \
   "${PREFILL_DEVICES}" "${DECODE_DEVICES}" \
+  >>"${RUN_ROOT}/run_manifest.json"
+printf '"warmup_prompts":%s,"warmup_input_len":%s,' \
+  "${WARMUP_PROMPTS}" "${WARMUP_INPUT_LEN}" \
+  >>"${RUN_ROOT}/run_manifest.json"
+printf '"warmup_output_len":%s,"warmup_concurrency":%s,"warmup_seed":%s,' \
+  "${WARMUP_OUTPUT_LEN}" "${WARMUP_CONCURRENCY}" "${WARMUP_SEED}" \
   >>"${RUN_ROOT}/run_manifest.json"
 printf '"trace_path":"%s","num_prompts":%s,"trace_time_scale":%s}\n' \
   "${MOONCAKE_TRACE_PATH}" "${NUM_PROMPTS}" "${TRACE_TIME_SCALE}" \
@@ -226,6 +293,7 @@ wait_for_url "http://${HOST}:${PREFILL_PORT}/v1/models" prefill
 wait_for_url "http://${HOST}:${DECODE_PORT}/v1/models" decode
 start_proxy "${RUN_ROOT}/traces/proxy" "${RUN_ROOT}/proxy.log"
 wait_for_url "http://${HOST}:${PROXY_PORT}/healthcheck" proxy 300
+run_warmup "${RUN_ROOT}" "${RUN_ID}"
 
 echo "Running Mooncake trace: P_TP=${PREFILL_TP_SIZE}, D_TP=${DECODE_TP_SIZE}"
 # shellcheck disable=SC2086
