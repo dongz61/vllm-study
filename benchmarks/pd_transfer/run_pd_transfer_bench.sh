@@ -22,6 +22,7 @@ WARMUP_INPUT_LEN=${WARMUP_INPUT_LEN:-4096}
 WARMUP_OUTPUT_LEN=${WARMUP_OUTPUT_LEN:-16}
 WARMUP_CONCURRENCY=${WARMUP_CONCURRENCY:-1}
 WARMUP_SEED=${WARMUP_SEED:-900000}
+TRANSFER_SLEEP_MS=${TRANSFER_SLEEP_MS_OVERRIDE:-${TRANSFER_SLEEP_MS:-0}}
 
 PIDS=()
 CLEANUP_PIDS=()
@@ -117,6 +118,10 @@ validate_config() {
   if [[ ! "${TRACE_TIME_SCALE}" =~ ^0*\.?0*[1-9][0-9]*$ \
         && ! "${TRACE_TIME_SCALE}" =~ ^[1-9][0-9]*(\.[0-9]+)?$ ]]; then
     echo "TRACE_TIME_SCALE must be positive, got ${TRACE_TIME_SCALE}" >&2
+    exit 1
+  fi
+  if [[ ! "${TRANSFER_SLEEP_MS}" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+    echo "TRANSFER_SLEEP_MS must be non-negative, got ${TRANSFER_SLEEP_MS}" >&2
     exit 1
   fi
   IFS=',' read -r -a p_devices <<< "${PREFILL_DEVICES}"
@@ -248,6 +253,7 @@ start_server() {
     export VLLM_NIXL_SIDE_CHANNEL_PORT="${side_port}"
     export VLLM_PD_TRACE_PATH="${trace_dir}/"
     export VLLM_PD_TRACE_ROLE="${role}"
+    export VLLM_PD_TRANSFER_SLEEP_MS="${TRANSFER_SLEEP_MS}"
     export TRANSFORMERS_OFFLINE HF_HUB_OFFLINE
     # Extra argument strings are intentionally word-split as CLI arguments.
     # shellcheck disable=SC2086
@@ -337,8 +343,10 @@ printf '"warmup_prompts":%s,"warmup_input_len":%s,' \
 printf '"warmup_output_len":%s,"warmup_concurrency":%s,"warmup_seed":%s,' \
   "${WARMUP_OUTPUT_LEN}" "${WARMUP_CONCURRENCY}" "${WARMUP_SEED}" \
   >>"${RUN_ROOT}/run_manifest.json"
-printf '"trace_path":"%s","num_prompts":%s,"trace_time_scale":%s}\n' \
+printf '"trace_path":"%s","num_prompts":%s,"trace_time_scale":%s,' \
   "${MOONCAKE_TRACE_PATH}" "${NUM_PROMPTS}" "${TRACE_TIME_SCALE}" \
+  >>"${RUN_ROOT}/run_manifest.json"
+printf '"transfer_sleep_ms":%s}\n' "${TRANSFER_SLEEP_MS}" \
   >>"${RUN_ROOT}/run_manifest.json"
 
 start_server prefill "${PREFILL_PORT}" "${PREFILL_SIDE_CHANNEL_PORT}" \
@@ -354,7 +362,7 @@ start_proxy "${RUN_ROOT}/traces/proxy" "${RUN_ROOT}/proxy.log"
 wait_for_url "http://${HOST}:${PROXY_PORT}/healthcheck" proxy 300
 run_warmup "${RUN_ROOT}" "${RUN_ID}"
 
-echo "Running Mooncake trace: P_TP=${PREFILL_TP_SIZE}, D_TP=${DECODE_TP_SIZE}"
+echo "Running Mooncake trace: P_TP=${PREFILL_TP_SIZE}, D_TP=${DECODE_TP_SIZE}, transfer_sleep_ms=${TRANSFER_SLEEP_MS}"
 # shellcheck disable=SC2086
 vllm bench serve \
   --backend vllm \

@@ -80,6 +80,8 @@ def build_rows(root: Path) -> list[dict[str, Any]]:
         prefill_done = _last(records, "prefill_compute_done")
         submit = _first(records, "transfer_submit")
         physical_done = _last(records, "transfer_physical_done")
+        sleep_start = _last(records, "transfer_injected_sleep_start")
+        sleep_end = _last(records, "transfer_injected_sleep_end")
         reported_done = _last(records, "transfer_reported_done")
         schedulable = _last(records, "transfer_schedulable")
         first_chunk = _first(records, "proxy_first_response_chunk")
@@ -90,6 +92,21 @@ def build_rows(root: Path) -> list[dict[str, Any]]:
         failed = any(record.get("event") == "transfer_failed" for record in records)
         full_wait_ms = "" if failed else _delta_ms(prefill_done, reported_done)
         proxy_ttft_ms = _delta_ms(received, first_chunk)
+        physical_to_reported_ms = _delta_ms(physical_done, reported_done)
+        sleep_start_to_end_ms = _delta_ms(sleep_start, sleep_end)
+        # Request-level exposed injection is the interval from completion on
+        # all TP ranks to expiration of all rank-local sleep gates.
+        observed_sleep_ms = _delta_ms(physical_done, sleep_end)
+        configured_sleep_ms: float | str = ""
+        if physical_done is not None:
+            configured_sleep_ms = float(physical_done.get("injected_sleep_ms", 0))
+            if configured_sleep_ms == 0 and physical_to_reported_ms != "":
+                observed_sleep_ms = 0.0
+        report_excluding_sleep_ms: float | str = ""
+        if physical_to_reported_ms != "" and observed_sleep_ms != "":
+            report_excluding_sleep_ms = round(
+                max(0.0, physical_to_reported_ms - observed_sleep_ms), 3
+            )
         wait_fraction = ""
         if full_wait_ms != "" and proxy_ttft_ms != "" and proxy_ttft_ms > 0:
             wait_fraction = round(full_wait_ms / proxy_ttft_ms, 6)
@@ -119,9 +136,17 @@ def build_rows(root: Path) -> list[dict[str, Any]]:
             "transfer_failed": failed,
             "prefill_to_submit_ms": _delta_ms(prefill_done, submit),
             "submit_to_physical_done_ms": _delta_ms(submit, physical_done),
-            "physical_done_to_reported_ms": _delta_ms(
-                physical_done, reported_done
+            "configured_transfer_sleep_ms": configured_sleep_ms,
+            "physical_done_to_sleep_start_ms": _delta_ms(physical_done, sleep_start),
+            "injected_sleep_observed_ms": observed_sleep_ms,
+            "sleep_start_to_sleep_end_ms": sleep_start_to_end_ms,
+            "sleep_end_to_reported_ms": (
+                _delta_ms(sleep_end, reported_done)
+                if sleep_end is not None
+                else physical_to_reported_ms
             ),
+            "physical_done_to_reported_excluding_sleep_ms": (report_excluding_sleep_ms),
+            "physical_done_to_reported_ms": physical_to_reported_ms,
             "prefill_to_reported_ms": full_wait_ms,
             "prefill_to_reported_over_ttft": wait_fraction,
             "reported_to_schedulable_ms": _delta_ms(reported_done, schedulable),
@@ -160,6 +185,18 @@ def write_outputs(root: Path, rows: list[dict[str, Any]]) -> None:
         for row in rows
         if row["prefill_to_reported_over_ttft"] != ""
     ]
+    configured_sleep_values = sorted(
+        {
+            float(row["configured_transfer_sleep_ms"])
+            for row in rows
+            if row["configured_transfer_sleep_ms"] != ""
+        }
+    )
+    observed_sleep_values = [
+        float(row["injected_sleep_observed_ms"])
+        for row in rows
+        if row["injected_sleep_observed_ms"] != ""
+    ]
     summary = {
         "requests_seen": len(rows),
         "requests_with_complete_interval": len(values),
@@ -168,6 +205,7 @@ def write_outputs(root: Path, rows: list[dict[str, Any]]) -> None:
             "Same-host intervals use perf_counter_ns; cross-host intervals use "
             "time_ns and require verified PTP/NTP synchronization."
         ),
+        "configured_transfer_sleep_ms": configured_sleep_values,
     }
     if values:
         summary["prefill_to_reported_ms"] = {
@@ -184,6 +222,14 @@ def write_outputs(root: Path, rows: list[dict[str, Any]]) -> None:
             "p90": round(percentile(fractions, 0.90), 6),
             "p99": round(percentile(fractions, 0.99), 6),
             "max": round(max(fractions), 6),
+        }
+    if observed_sleep_values:
+        summary["injected_sleep_observed_ms"] = {
+            "mean": round(statistics.fmean(observed_sleep_values), 3),
+            "p50": round(percentile(observed_sleep_values, 0.50), 3),
+            "p90": round(percentile(observed_sleep_values, 0.90), 3),
+            "p99": round(percentile(observed_sleep_values, 0.99), 3),
+            "max": round(max(observed_sleep_values), 3),
         }
     summary_path = root / "pd_transfer_summary.json"
     summary_path.write_text(

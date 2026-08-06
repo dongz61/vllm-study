@@ -3,6 +3,7 @@
 """Base worker-side logic for the NIXL connector."""
 
 import logging
+import math
 import os
 import queue
 import threading
@@ -423,6 +424,16 @@ class NixlBaseConnectorWorker:
         # [req_id -> list[handle]]
         self._recving_metadata: dict[ReqId, ReqMeta] = {}
         self._recving_transfers = defaultdict[ReqId, list[TransferHandle]](list)
+        self._pd_transfer_sleep_ms = self._get_pd_transfer_sleep_ms()
+        if self._pd_transfer_sleep_ms > 0:
+            logger.info(
+                "PD transfer completion sleep injection enabled: %.3f ms",
+                self._pd_transfer_sleep_ms,
+            )
+        # Requests whose NIXL handles have physically completed but whose
+        # completion notification is intentionally delayed for experiments.
+        # The deadline queue keeps the worker available to poll other requests.
+        self._delayed_recving_transfers: dict[ReqId, float] = {}
         # Track the expiration time of requests that are waiting to be sent.
         self._reqs_to_send: dict[ReqId, float] = {}
         # Set of requests that have been part of a batch, regardless of status.
@@ -2009,7 +2020,7 @@ class NixlBaseConnectorWorker:
         Returns:
             set of req_ids that have all done xfers
         """
-        done_req_ids: set[str] = set()
+        done_req_ids = self._pop_delayed_recv_transfers()
         for req_id, handles in list(transfers.items()):
             in_progress = []
             failed = False
@@ -2059,7 +2070,6 @@ class NixlBaseConnectorWorker:
 
             if not in_progress:
                 # Only report request as completed when all transfers are done.
-                done_req_ids.add(req_id)
                 del transfers[req_id]
                 trace_event(
                     "transfer_physical_done",
@@ -2068,10 +2078,68 @@ class NixlBaseConnectorWorker:
                     tp_rank=self.tp_rank,
                     local_tp_size=self.world_size,
                     success=not failed,
+                    injected_sleep_ms=self._pd_transfer_sleep_ms,
                 )
+                # Failed transfers must be reported immediately so the
+                # scheduler can enter its recompute/error path. Successful
+                # transfers use a deadline rather than time.sleep(), which
+                # would block polling for every other request on this worker.
+                if not failed and self._pd_transfer_sleep_ms > 0:
+                    ready_at = (
+                        time.perf_counter() + self._pd_transfer_sleep_ms / 1000
+                    )
+                    self._delayed_recving_transfers[req_id] = ready_at
+                    trace_event(
+                        "transfer_injected_sleep_start",
+                        req_id,
+                        role="decode",
+                        tp_rank=self.tp_rank,
+                        local_tp_size=self.world_size,
+                        sleep_ms=self._pd_transfer_sleep_ms,
+                    )
+                else:
+                    done_req_ids.add(req_id)
             else:
                 transfers[req_id] = in_progress
         return done_req_ids
+
+    def _pop_delayed_recv_transfers(self) -> set[str]:
+        """Return physically-complete transfers whose delay has expired."""
+        now = time.perf_counter()
+        done_req_ids: set[str] = set()
+        for req_id, ready_at in list(self._delayed_recving_transfers.items()):
+            if now < ready_at:
+                continue
+            trace_event(
+                "transfer_injected_sleep_end",
+                req_id,
+                role="decode",
+                tp_rank=self.tp_rank,
+                local_tp_size=self.world_size,
+                sleep_ms=self._pd_transfer_sleep_ms,
+            )
+            done_req_ids.add(req_id)
+            del self._delayed_recving_transfers[req_id]
+        return done_req_ids
+
+    @staticmethod
+    def _get_pd_transfer_sleep_ms() -> float:
+        raw_value = os.getenv("VLLM_PD_TRANSFER_SLEEP_MS", "0")
+        try:
+            value = float(raw_value)
+        except ValueError:
+            logger.warning(
+                "Ignoring invalid VLLM_PD_TRANSFER_SLEEP_MS=%r; using 0", raw_value
+            )
+            return 0.0
+        if not math.isfinite(value) or value < 0:
+            logger.warning(
+                "VLLM_PD_TRANSFER_SLEEP_MS must be finite and non-negative, "
+                "got %r; using 0",
+                raw_value,
+            )
+            return 0.0
+        return value
 
     def _handle_failed_transfer(self, req_id: str, handle: int | None):
         """
@@ -2408,6 +2476,7 @@ class NixlBaseConnectorWorker:
             for handle in handles:
                 self.nixl_wrapper.release_xfer_handle(handle)
         self._recving_transfers.clear()
+        self._delayed_recving_transfers.clear()
         for handle in self.src_xfer_handles_by_block_size.values():
             self.nixl_wrapper.release_dlist_handle(handle)
         self.src_xfer_handles_by_block_size.clear()

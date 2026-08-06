@@ -20,14 +20,16 @@ from parse_pd_trace import build_rows, percentile
 COMPONENT_FIELDS = (
     "prefill_to_submit_ms",
     "submit_to_physical_done_ms",
-    "physical_done_to_reported_ms",
+    "injected_sleep_observed_ms",
+    "physical_done_to_reported_excluding_sleep_ms",
 )
 COMPONENT_LABELS = (
     "Prefill done -> first submit",
     "First submit -> all transfers done",
-    "Physical done -> reported",
+    "Injected sleep (observed)",
+    "Other physical done -> reported",
 )
-COMPONENT_COLORS = ("#4C78A8", "#F58518", "#54A24B")
+COMPONENT_COLORS = ("#4C78A8", "#F58518", "#E45756", "#54A24B")
 
 
 @dataclass
@@ -39,7 +41,7 @@ class Case:
     ttft_ms: list[float]
     full_ms: list[float]
     ratios: list[float]
-    components_ms: tuple[list[float], list[float], list[float]]
+    components_ms: tuple[list[float], ...]
 
 
 def _float(row: dict[str, Any], field: str) -> float | None:
@@ -67,7 +69,10 @@ def _case_label(manifest: dict[str, Any]) -> str:
     prefill_tp = manifest.get("prefill_tp_size", "?")
     decode_tp = manifest.get("decode_tp_size", "?")
     scale = manifest.get("trace_time_scale", "?")
-    return f"{dataset}\nP{prefill_tp}-D{decode_tp}, scale={scale}"
+    label = f"{dataset}\nP{prefill_tp}-D{decode_tp}, scale={scale}"
+    if "transfer_sleep_ms" in manifest:
+        label += f", sleep={manifest['transfer_sleep_ms']} ms"
+    return label
 
 
 def discover_runs(inputs: list[Path]) -> list[Path]:
@@ -93,7 +98,7 @@ def load_case(run_dir: Path) -> Case | None:
     ttft_ms: list[float] = []
     full_ms: list[float] = []
     ratios: list[float] = []
-    component_lists: tuple[list[float], list[float], list[float]] = ([], [], [])
+    component_lists: tuple[list[float], ...] = tuple([] for _ in COMPONENT_FIELDS)
     for row in rows:
         ttft = _float(row, "proxy_ttft_ms")
         full = _float(row, "prefill_to_reported_ms")
@@ -226,7 +231,7 @@ def plot_internal_breakdown(cases: list[Case], output_path: Path) -> None:
     y_positions = list(range(len(cases)))
     left = [0.0] * len(cases)
     fig, ax = plt.subplots(
-        figsize=(10.2, _figure_height(len(cases))), layout="constrained"
+        figsize=(11.2, _figure_height(len(cases))), layout="constrained"
     )
     for index, (component_label, color) in enumerate(
         zip(COMPONENT_LABELS, COMPONENT_COLORS, strict=True)
@@ -259,7 +264,7 @@ def plot_internal_breakdown(cases: list[Case], output_path: Path) -> None:
     ax.set_xlabel("Share of complete PD-transfer latency (%)")
     ax.set_title("Internal breakdown of complete PD-transfer latency")
     ax.grid(axis="x", alpha=0.25)
-    ax.legend(loc="upper center", bbox_to_anchor=(0.5, -0.20), ncols=3)
+    ax.legend(loc="upper center", bbox_to_anchor=(0.5, -0.20), ncols=2)
     fig.savefig(output_path, dpi=180)
     plt.close(fig)
 
@@ -282,6 +287,7 @@ def write_summary(cases: list[Case], output_path: Path) -> None:
                 "prefill_tp_size": case.manifest.get("prefill_tp_size", ""),
                 "decode_tp_size": case.manifest.get("decode_tp_size", ""),
                 "trace_time_scale": case.manifest.get("trace_time_scale", ""),
+                "transfer_sleep_ms": case.manifest.get("transfer_sleep_ms", 0),
                 "requests_seen": case.rows_seen,
                 "requests_complete": len(case.full_ms),
                 "pd_over_ttft_mean_request_pct": statistics.fmean(case.ratios)
@@ -296,16 +302,28 @@ def write_summary(cases: list[Case], output_path: Path) -> None:
                 "pd_complete_mean_ms": statistics.fmean(case.full_ms),
                 "prefill_to_submit_mean_ms": component_means[0],
                 "submit_to_all_physical_done_mean_ms": component_means[1],
-                "physical_done_to_reported_mean_ms": component_means[2],
+                "injected_sleep_observed_mean_ms": component_means[2],
+                "physical_done_to_reported_excluding_sleep_mean_ms": (
+                    component_means[3]
+                ),
+                "physical_done_to_reported_mean_ms": (
+                    component_means[2] + component_means[3]
+                ),
                 "prefill_to_submit_internal_pct": component_sums[0]
                 / components_total
                 * 100,
                 "submit_to_all_physical_done_internal_pct": component_sums[1]
                 / components_total
                 * 100,
-                "physical_done_to_reported_internal_pct": component_sums[2]
+                "injected_sleep_internal_pct": component_sums[2]
                 / components_total
                 * 100,
+                "physical_done_to_reported_excluding_sleep_internal_pct": (
+                    component_sums[3] / components_total * 100
+                ),
+                "physical_done_to_reported_internal_pct": (
+                    (component_sums[2] + component_sums[3]) / components_total * 100
+                ),
             }
         )
 
