@@ -24,28 +24,42 @@ WARMUP_CONCURRENCY=${WARMUP_CONCURRENCY:-1}
 WARMUP_SEED=${WARMUP_SEED:-900000}
 
 PIDS=()
+CLEANUP_PIDS=()
 
-kill_tree() {
+collect_process_tree() {
   local pid=$1 child
   if ! kill -0 "${pid}" >/dev/null 2>&1; then
     return
   fi
+  CLEANUP_PIDS+=("${pid}")
   while read -r child; do
-    [[ -n "${child}" ]] && kill_tree "${child}"
+    [[ -n "${child}" ]] && collect_process_tree "${child}"
   done < <(pgrep -P "${pid}" 2>/dev/null || true)
-  kill "${pid}" >/dev/null 2>&1 || true
 }
 
 cleanup() {
-  local pid
+  local pid index had_pids=${#PIDS[@]}
+  CLEANUP_PIDS=()
   for pid in "${PIDS[@]}"; do
-    kill_tree "${pid}"
+    collect_process_tree "${pid}"
+  done
+  # Stop parents first so that they cannot spawn replacement children, then
+  # signal every descendant captured before the tree is re-parented.
+  for pid in "${CLEANUP_PIDS[@]}"; do
+    kill "${pid}" >/dev/null 2>&1 || true
   done
   sleep "${CLEANUP_GRACE_SECONDS:-5}"
+  for ((index = ${#CLEANUP_PIDS[@]} - 1; index >= 0; index--)); do
+    kill -9 "${CLEANUP_PIDS[index]}" >/dev/null 2>&1 || true
+  done
   for pid in "${PIDS[@]}"; do
-    kill -9 "${pid}" >/dev/null 2>&1 || true
+    wait "${pid}" 2>/dev/null || true
   done
   PIDS=()
+  CLEANUP_PIDS=()
+  if (( had_pids > 0 )); then
+    wait_for_ports_free "${PORT_RELEASE_TIMEOUT_SECONDS:-60}"
+  fi
 }
 trap cleanup EXIT
 
@@ -128,12 +142,53 @@ import sys
 
 host, port = sys.argv[1], int(sys.argv[2])
 bind_host = "0.0.0.0" if host in ("localhost", "127.0.0.1") else host
+connect_host = "127.0.0.1" if host == "localhost" else host
+with socket.socket() as probe:
+    probe.settimeout(0.2)
+    if probe.connect_ex((connect_host, port)) == 0:
+        raise SystemExit(1)
 with socket.socket() as sock:
+    # Match the server's reusable-listener behavior. This treats harmless
+    # TIME_WAIT sockets as available while still rejecting a live listener.
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     try:
         sock.bind((bind_host, port))
     except OSError:
         raise SystemExit(1)
 PY
+}
+
+wait_for_ports_free() {
+  local timeout=$1 waited=0 port all_free
+  local -a ports=(
+    "${PREFILL_PORT}"
+    "${DECODE_PORT}"
+    "${PROXY_PORT}"
+    "${PREFILL_SIDE_CHANNEL_PORT}"
+    "${DECODE_SIDE_CHANNEL_PORT}"
+  )
+  while (( waited < timeout )); do
+    all_free=1
+    for port in "${ports[@]}"; do
+      if ! is_port_free "${HOST}" "${port}"; then
+        all_free=0
+        break
+      fi
+    done
+    if (( all_free )); then
+      echo "All benchmark ports released"
+      return 0
+    fi
+    sleep 1
+    waited=$((waited + 1))
+  done
+  echo "Timed out after ${timeout}s waiting for benchmark ports to be released" >&2
+  for port in "${ports[@]}"; do
+    if ! is_port_free "${HOST}" "${port}"; then
+      echo "Port ${port} is still in use" >&2
+    fi
+  done
+  return 1
 }
 
 check_ports() {
