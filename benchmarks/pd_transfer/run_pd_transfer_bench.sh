@@ -11,6 +11,10 @@ fi
 # shellcheck source=/dev/null
 source "${CONFIG_PATH}"
 
+# The sweep wrapper supplies per-case overrides after sourcing the shared
+# config, so every case can reuse the same configuration file.
+TRACE_TIME_SCALE=${TRACE_TIME_SCALE_OVERRIDE:-${TRACE_TIME_SCALE}}
+
 # Keep existing config.env files working while enabling a representative,
 # content-disjoint warm-up by default.
 WARMUP_PROMPTS=${WARMUP_PROMPTS:-4}
@@ -261,8 +265,8 @@ run_warmup() {
 validate_config
 check_ports
 
-RUN_ID=$(date "+%Y%m%d-%H%M%S")
-RUN_ROOT="${RESULT_ROOT}/${RUN_ID}"
+RUN_ID=${RUN_ID_OVERRIDE:-$(date "+%Y%m%d-%H%M%S")}
+RUN_ROOT=${RUN_ROOT_OVERRIDE:-"${RESULT_ROOT}/${RUN_ID}"}
 mkdir -p "${RUN_ROOT}/traces/prefill" "${RUN_ROOT}/traces/decode" \
   "${RUN_ROOT}/traces/proxy"
 
