@@ -165,7 +165,7 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
         for i, spec in enumerate(read_specs):
             remote_block_size = remote_info.remote_block_size
             logger.debug(
-                "Remote agent %s available, calling _read_blocks"
+                "Remote agent %s available, calling _read_blocks"调
                 " on remote rank %s with remote block size %s for req %s",
                 meta.remote.engine_id,
                 spec.remote_rank,
