@@ -16,6 +16,51 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
 )
 
 
+_CUDA_IPC_HANDLE_SIZE = 64
+_TORCH_SHAREABLE_HANDLE_HEADER_SIZE = 2
+_TORCH_SHAREABLE_HANDLE_VERSION = 2
+_TORCH_SHAREABLE_CUDA_MALLOC = ord("c")
+_TORCH_SHAREABLE_CUDA_EXPANDABLE_SEGMENT = ord("e")
+
+
+def _unwrap_torch_cuda_ipc_handle(handle: bytes) -> bytes:
+    """Return the raw cudaIpcMemHandle_t from a PyTorch shareable handle."""
+    if len(handle) == _CUDA_IPC_HANDLE_SIZE:
+        # PyTorch versions before the versioned shareable-handle envelope.
+        return handle
+
+    if len(handle) < _TORCH_SHAREABLE_HANDLE_HEADER_SIZE:
+        raise RuntimeError(
+            f"Malformed PyTorch CUDA IPC handle: got {len(handle)} bytes"
+        )
+
+    version, handle_type = handle[:_TORCH_SHAREABLE_HANDLE_HEADER_SIZE]
+    if version > _TORCH_SHAREABLE_HANDLE_VERSION:
+        raise RuntimeError(
+            "Unsupported PyTorch CUDA IPC shareable-handle version "
+            f"{version}; maximum supported version is "
+            f"{_TORCH_SHAREABLE_HANDLE_VERSION}"
+        )
+    if handle_type == _TORCH_SHAREABLE_CUDA_EXPANDABLE_SEGMENT:
+        raise RuntimeError(
+            "CUDA IPC gather does not support PyTorch expandable-segment "
+            "shareable handles; disable expandable_segments for the KV cache"
+        )
+    if handle_type != _TORCH_SHAREABLE_CUDA_MALLOC:
+        raise RuntimeError(
+            "Unsupported PyTorch CUDA IPC shareable-handle type "
+            f"{handle_type!r}"
+        )
+
+    raw_handle = handle[_TORCH_SHAREABLE_HANDLE_HEADER_SIZE:]
+    if len(raw_handle) != _CUDA_IPC_HANDLE_SIZE:
+        raise RuntimeError(
+            "Malformed PyTorch cudaMalloc IPC handle: expected "
+            f"{_CUDA_IPC_HANDLE_SIZE} payload bytes, got {len(raw_handle)}"
+        )
+    return raw_handle
+
+
 def export_cuda_ipc_region(tensor: torch.Tensor) -> CudaIpcRegion:
     """Export a tensor's allocator allocation handle and data offset."""
     if not tensor.is_cuda:
@@ -52,7 +97,7 @@ def export_cuda_ipc_region(tensor: torch.Tensor) -> CudaIpcRegion:
         raise RuntimeError("Unexpected torch CUDA IPC reduction tuple")
 
     tensor_offset_elements = int(rebuild_args[3])
-    allocation_handle = bytes(rebuild_args[7])
+    allocation_handle = _unwrap_torch_cuda_ipc_handle(bytes(rebuild_args[7]))
     allocation_size_bytes = int(rebuild_args[8])
     storage_offset_bytes = int(rebuild_args[9])
     data_offset_bytes = (
