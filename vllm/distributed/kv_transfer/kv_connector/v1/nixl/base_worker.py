@@ -50,7 +50,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.tp_mapping import (
     _is_ssm_spec,
     compute_tp_mapping,
 )
-from vllm.distributed.kv_transfer.pd_trace import trace_event
+from vllm.distributed.kv_transfer.pd_trace import is_trace_enabled, trace_event
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.utils import (
     _NIXL_SUPPORTED_DEVICE,
     get_representative_spec_type,
@@ -424,6 +424,10 @@ class NixlBaseConnectorWorker:
         # [req_id -> list[handle]]
         self._recving_metadata: dict[ReqId, ReqMeta] = {}
         self._recving_transfers = defaultdict[ReqId, list[TransferHandle]](list)
+        # Per-handle context for low-overhead rank-level transfer tracing:
+        # remote rank and the timestamp immediately after transfer submission.
+        self._pd_trace_enabled = is_trace_enabled()
+        self._recv_transfer_trace_meta: dict[TransferHandle, tuple[int, int]] = {}
         self._pd_transfer_sleep_ms = self._get_pd_transfer_sleep_ms()
         if self._pd_transfer_sleep_ms > 0:
             logger.info(
@@ -2028,21 +2032,57 @@ class NixlBaseConnectorWorker:
                 try:
                     xfer_state = self.nixl_wrapper.check_xfer_state(handle)
                     if xfer_state == "DONE":
+                        done_observed_ns = (
+                            time.perf_counter_ns()
+                            if getattr(self, "_pd_trace_enabled", False)
+                            else 0
+                        )
                         # Get telemetry from NIXL
                         res = self.nixl_wrapper.get_xfer_telemetry(handle)
                         self.xfer_stats.record_transfer(res)
+                        trace_meta = getattr(
+                            self, "_recv_transfer_trace_meta", {}
+                        ).pop(handle, None)
+                        if trace_meta is not None:
+                            remote_rank, submit_ns = trace_meta
+                            trace_event(
+                                "transfer_rank_done_observed",
+                                req_id,
+                                role="decode",
+                                tp_rank=self.tp_rank,
+                                local_tp_size=self.world_size,
+                                remote_rank=remote_rank,
+                                submit_to_done_observed_ms=round(
+                                    (done_observed_ns - submit_ns) / 1_000_000,
+                                    3,
+                                ),
+                                nixl_xfer_duration_ms=round(
+                                    float(res.xferDuration) / 1_000, 3
+                                ),
+                                nixl_post_duration_ms=round(
+                                    float(res.postDuration) / 1_000, 3
+                                ),
+                                bytes_transferred=int(res.totalBytes),
+                                num_descriptors=int(res.descCount),
+                            )
                         self.nixl_wrapper.release_xfer_handle(handle)
                     elif xfer_state == "PROC":
                         in_progress.append(handle)
                         continue
                     else:
                         failed = True
+                        trace_meta = getattr(
+                            self, "_recv_transfer_trace_meta", {}
+                        ).pop(handle, None)
                         trace_event(
                             "transfer_failed",
                             req_id,
                             role="decode",
                             tp_rank=self.tp_rank,
                             xfer_state=xfer_state,
+                            remote_rank=(
+                                trace_meta[0] if trace_meta is not None else None
+                            ),
                         )
                         self._log_failure(
                             failure_type="transfer_failed",
@@ -2053,12 +2093,18 @@ class NixlBaseConnectorWorker:
                         self._handle_failed_transfer(req_id, handle)
                 except Exception as e:
                     failed = True
+                    trace_meta = getattr(
+                        self, "_recv_transfer_trace_meta", {}
+                    ).pop(handle, None)
                     trace_event(
                         "transfer_failed",
                         req_id,
                         role="decode",
                         tp_rank=self.tp_rank,
                         error=repr(e),
+                        remote_rank=(
+                            trace_meta[0] if trace_meta is not None else None
+                        ),
                     )
                     self._log_failure(
                         failure_type="transfer_exception",
@@ -2476,6 +2522,7 @@ class NixlBaseConnectorWorker:
             for handle in handles:
                 self.nixl_wrapper.release_xfer_handle(handle)
         self._recving_transfers.clear()
+        getattr(self, "_recv_transfer_trace_meta", {}).clear()
         self._delayed_recving_transfers.clear()
         for handle in self.src_xfer_handles_by_block_size.values():
             self.nixl_wrapper.release_dlist_handle(handle)

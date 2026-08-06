@@ -66,6 +66,21 @@ def _delta_ms(start: dict[str, Any] | None, end: dict[str, Any] | None):
     return round((end[clock] - start[clock]) / 1_000_000, 3)
 
 
+def _aggregate_numeric_field(
+    records: list[dict[str, Any]], field: str, operation: str
+) -> float | int | str:
+    values = [record[field] for record in records if field in record]
+    if not values:
+        return ""
+    if operation == "sum":
+        value = sum(values)
+    elif operation == "max":
+        value = max(values)
+    else:
+        raise ValueError(f"unsupported aggregation: {operation}")
+    return round(value, 3) if isinstance(value, float) else value
+
+
 def build_rows(root: Path) -> list[dict[str, Any]]:
     grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for record in iter_records(root):
@@ -78,6 +93,8 @@ def build_rows(root: Path) -> list[dict[str, Any]]:
     for request_id, records in grouped.items():
         received = _first(records, "proxy_request_received")
         prefill_done = _last(records, "prefill_compute_done")
+        request_prepare_start = _first(records, "transfer_request_prepare_start")
+        request_prepare_done = _last(records, "transfer_request_prepare_done")
         submit = _first(records, "transfer_submit")
         physical_done = _last(records, "transfer_physical_done")
         sleep_start = _last(records, "transfer_injected_sleep_start")
@@ -88,6 +105,16 @@ def build_rows(root: Path) -> list[dict[str, Any]]:
         submit_records = [
             record for record in records if record.get("event") == "transfer_submit"
         ]
+        submit_records.sort(key=lambda record: record["ts_ns"])
+        rank_done_records = [
+            record
+            for record in records
+            if record.get("event") == "transfer_rank_done_observed"
+        ]
+        rank_done_records.sort(key=lambda record: record["ts_ns"])
+        first_submit = submit_records[0] if submit_records else None
+        last_submit = submit_records[-1] if submit_records else None
+        last_rank_done = rank_done_records[-1] if rank_done_records else None
         hosts = sorted({str(record.get("host", "")) for record in records})
         failed = any(record.get("event") == "transfer_failed" for record in records)
         full_wait_ms = "" if failed else _delta_ms(prefill_done, reported_done)
@@ -124,6 +151,10 @@ def build_rows(root: Path) -> list[dict[str, Any]]:
                 else ""
             ),
             "num_transfer_submits": len(submit_records),
+            "num_rank_done_observed": len(rank_done_records),
+            "transfer_remote_rank_order": ";".join(
+                str(record.get("remote_rank", "")) for record in submit_records
+            ),
             "hosts": ";".join(hosts),
             "cross_host": len(hosts) > 1,
             "full_interval_clock": (
@@ -134,7 +165,93 @@ def build_rows(root: Path) -> list[dict[str, Any]]:
                 else "wall"
             ),
             "transfer_failed": failed,
+            "prefill_to_request_prepare_start_ms": _delta_ms(
+                prefill_done, request_prepare_start
+            ),
+            "request_prepare_start_to_first_submit_ms": _delta_ms(
+                request_prepare_start, submit
+            ),
+            "request_prepare_total_ms": (
+                request_prepare_done.get("request_prepare_total_ms", "")
+                if request_prepare_done
+                else ""
+            ),
+            "read_plan_ms": (
+                request_prepare_done.get("read_plan_ms", "")
+                if request_prepare_done
+                else ""
+            ),
+            "rank_submit_loop_ms": (
+                request_prepare_done.get("rank_submit_loop_ms", "")
+                if request_prepare_done
+                else ""
+            ),
             "prefill_to_submit_ms": _delta_ms(prefill_done, submit),
+            "first_to_last_submit_ms": _delta_ms(first_submit, last_submit),
+            "first_rank_preprocess_ms": (
+                first_submit.get("rank_preprocess_ms", "") if first_submit else ""
+            ),
+            "first_rank_remote_desc_ms": (
+                first_submit.get("remote_desc_ms", "") if first_submit else ""
+            ),
+            "first_rank_local_desc_ms": (
+                first_submit.get("local_desc_ms", "") if first_submit else ""
+            ),
+            "first_rank_make_prepped_xfer_ms": (
+                first_submit.get("make_prepped_xfer_ms", "")
+                if first_submit
+                else ""
+            ),
+            "first_rank_transfer_call_ms": (
+                first_submit.get("transfer_call_ms", "") if first_submit else ""
+            ),
+            "first_rank_prepare_total_ms": (
+                first_submit.get("rank_prepare_total_ms", "")
+                if first_submit
+                else ""
+            ),
+            "all_rank_preprocess_sum_ms": _aggregate_numeric_field(
+                submit_records, "rank_preprocess_ms", "sum"
+            ),
+            "all_rank_remote_desc_sum_ms": _aggregate_numeric_field(
+                submit_records, "remote_desc_ms", "sum"
+            ),
+            "all_rank_local_desc_sum_ms": _aggregate_numeric_field(
+                submit_records, "local_desc_ms", "sum"
+            ),
+            "all_rank_make_prepped_xfer_sum_ms": _aggregate_numeric_field(
+                submit_records, "make_prepped_xfer_ms", "sum"
+            ),
+            "all_rank_transfer_call_sum_ms": _aggregate_numeric_field(
+                submit_records, "transfer_call_ms", "sum"
+            ),
+            "all_rank_prepare_sum_ms": _aggregate_numeric_field(
+                submit_records, "rank_prepare_total_ms", "sum"
+            ),
+            "max_rank_submit_to_done_observed_ms": _aggregate_numeric_field(
+                rank_done_records, "submit_to_done_observed_ms", "max"
+            ),
+            "first_submit_to_last_rank_done_observed_ms": _delta_ms(
+                first_submit, last_rank_done
+            ),
+            "last_submit_to_last_rank_done_observed_ms": _delta_ms(
+                last_submit, last_rank_done
+            ),
+            "last_rank_done_observed_to_physical_done_ms": _delta_ms(
+                last_rank_done, physical_done
+            ),
+            "max_nixl_xfer_duration_ms": _aggregate_numeric_field(
+                rank_done_records, "nixl_xfer_duration_ms", "max"
+            ),
+            "max_nixl_post_duration_ms": _aggregate_numeric_field(
+                rank_done_records, "nixl_post_duration_ms", "max"
+            ),
+            "total_bytes_transferred": _aggregate_numeric_field(
+                rank_done_records, "bytes_transferred", "sum"
+            ),
+            "total_descriptors": _aggregate_numeric_field(
+                submit_records, "num_descriptors", "sum"
+            ),
             "submit_to_physical_done_ms": _delta_ms(submit, physical_done),
             "configured_transfer_sleep_ms": configured_sleep_ms,
             "physical_done_to_sleep_start_ms": _delta_ms(physical_done, sleep_start),

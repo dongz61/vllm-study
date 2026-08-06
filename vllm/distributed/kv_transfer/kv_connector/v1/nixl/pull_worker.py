@@ -27,6 +27,10 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+def _duration_ms(start_ns: int, end_ns: int) -> float:
+    return round((end_ns - start_ns) / 1_000_000, 3)
+
+
 class NixlPullConnectorWorker(NixlBaseConnectorWorker):
     """Pull-specific (READ) worker logic."""
 
@@ -102,11 +106,25 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
     def _read_blocks_for_req(self, req_id: str, meta: ReqMeta):
         assert meta.remote is not None and self.transfer_topo is not None
         engine_id = meta.remote.engine_id
+        remote_info = self.transfer_topo.get_engine_info(engine_id)
+        trace_enabled = getattr(self, "_pd_trace_enabled", False)
+        if trace_enabled:
+            trace_event(
+                "transfer_request_prepare_start",
+                req_id,
+                role="decode",
+                tp_rank=self.tp_rank,
+                local_tp_size=self.world_size,
+                remote_engine_id=engine_id,
+                remote_tp_size=remote_info.remote_tp_size,
+            )
+            request_prepare_start_ns = time.perf_counter_ns()
+        else:
+            request_prepare_start_ns = 0
         # Update last activity from this remote. Mind that cleanup is done on main
         # thread (this one), so we don't race on this structure.
         self._engine_last_active[engine_id] = time.perf_counter()
         plan = self.tp_mappings[engine_id]
-        remote_info = self.transfer_topo.get_engine_info(engine_id)
         tp_ratio = self.transfer_topo.tp_ratio(remote_info.remote_tp_size)
 
         meta.remote.block_ids = self._logical_to_remote_kernel_block_ids(
@@ -140,6 +158,9 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
         # the first remote rank (cache is duplicated)..
         if self.use_mla and tp_ratio < 0:
             assert len(read_specs) == 1
+        read_plan_done_ns = (
+            time.perf_counter_ns() if trace_enabled else 0
+        )
 
         for i, spec in enumerate(read_specs):
             remote_block_size = remote_info.remote_block_size
@@ -178,6 +199,27 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                 remote_xfer_side_handle=remote_xfer_side_handle,
             )
 
+        if trace_enabled:
+            request_prepare_done_ns = time.perf_counter_ns()
+            trace_event(
+                "transfer_request_prepare_done",
+                req_id,
+                role="decode",
+                tp_rank=self.tp_rank,
+                local_tp_size=self.world_size,
+                remote_tp_size=remote_info.remote_tp_size,
+                num_remote_ranks=len(read_specs),
+                read_plan_ms=_duration_ms(
+                    request_prepare_start_ns, read_plan_done_ns
+                ),
+                rank_submit_loop_ms=_duration_ms(
+                    read_plan_done_ns, request_prepare_done_ns
+                ),
+                request_prepare_total_ms=_duration_ms(
+                    request_prepare_start_ns, request_prepare_done_ns
+                ),
+            )
+
         if self.use_mla and tp_ratio < 0 and read_specs:
             # ..but we still need to notify the other remote ranks that we
             # have the blocks we need so they can update the request state.
@@ -201,6 +243,8 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
         a single remote worker.
         """
         assert self.transfer_topo is not None
+        trace_enabled = getattr(self, "_pd_trace_enabled", False)
+        prepare_start_ns = time.perf_counter_ns() if trace_enabled else 0
         remote_rank = read_spec.remote_rank
         local_block_ids = read_spec.local_block_ids
         remote_block_ids = read_spec.remote_block_ids
@@ -266,6 +310,18 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                     remote_agent_name=agent_name,
                 )
                 self.xfer_stats.record_failed_notification()
+            if trace_enabled:
+                trace_event(
+                    "transfer_rank_skipped",
+                    request_id,
+                    role="decode",
+                    tp_rank=self.tp_rank,
+                    remote_rank=remote_rank,
+                    reason="full_prefix_cache_hit",
+                    rank_prepare_total_ms=_duration_ms(
+                        prepare_start_ns, time.perf_counter_ns()
+                    ),
+                )
             return
 
         assert (
@@ -277,6 +333,7 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
         local_block_ids, remote_block_ids = self._apply_prefix_caching(
             local_block_ids, remote_block_ids, remote_physical_per_logical
         )
+        desc_start_ns = time.perf_counter_ns() if trace_enabled else 0
 
         # NOTE (nicolo) With homogeneous TP, each TP worker loads KV from
         # corresponding rank. With heterogeneous TP, fixing D>P, the D tp
@@ -289,11 +346,17 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
             block_size_ratio=None,
             physical_blocks_per_logical=remote_info.remote_physical_blocks_per_logical,
         )
+        remote_desc_done_ns = (
+            time.perf_counter_ns() if trace_enabled else 0
+        )
         local_block_descs_ids = self._compute_desc_ids(
             block_ids=local_block_ids,
             dst_num_blocks=self.dst_num_blocks[self.engine_id],
             block_size_ratio=block_size_ratio,
             physical_blocks_per_logical=self._physical_blocks_per_logical_kv_block,
+        )
+        local_desc_done_ns = (
+            time.perf_counter_ns() if trace_enabled else 0
         )
 
         assert len(local_block_descs_ids) == len(remote_block_descs_ids)
@@ -309,22 +372,54 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                 remote_block_descs_ids,
                 notif_msg=notif_id,
             )
+            make_prepped_done_ns = (
+                time.perf_counter_ns() if trace_enabled else 0
+            )
 
             # Begin async xfer.
             self.nixl_wrapper.transfer(handle)
+            transfer_call_done_ns = (
+                time.perf_counter_ns() if trace_enabled else 0
+            )
 
             # Use handle to check completion in future step().
             self._recving_transfers[request_id].append(handle)
-            trace_event(
-                "transfer_submit",
-                request_id,
-                role="decode",
-                tp_rank=self.tp_rank,
-                local_tp_size=self.world_size,
-                remote_tp_size=remote_info.remote_tp_size,
-                remote_rank=remote_rank,
-                num_descriptors=len(local_block_descs_ids),
-            )
+            if trace_enabled:
+                self._recv_transfer_trace_meta[handle] = (
+                    remote_rank,
+                    transfer_call_done_ns,
+                )
+                trace_event(
+                    "transfer_submit",
+                    request_id,
+                    role="decode",
+                    tp_rank=self.tp_rank,
+                    local_tp_size=self.world_size,
+                    remote_tp_size=remote_info.remote_tp_size,
+                    remote_rank=remote_rank,
+                    num_descriptors=len(local_block_descs_ids),
+                    num_local_blocks=sum(len(group) for group in local_block_ids),
+                    num_remote_blocks=sum(len(group) for group in remote_block_ids),
+                    num_kv_groups=len(local_block_ids),
+                    rank_preprocess_ms=_duration_ms(
+                        prepare_start_ns, desc_start_ns
+                    ),
+                    remote_desc_ms=_duration_ms(
+                        desc_start_ns, remote_desc_done_ns
+                    ),
+                    local_desc_ms=_duration_ms(
+                        remote_desc_done_ns, local_desc_done_ns
+                    ),
+                    make_prepped_xfer_ms=_duration_ms(
+                        local_desc_done_ns, make_prepped_done_ns
+                    ),
+                    transfer_call_ms=_duration_ms(
+                        make_prepped_done_ns, transfer_call_done_ns
+                    ),
+                    rank_prepare_total_ms=_duration_ms(
+                        prepare_start_ns, transfer_call_done_ns
+                    ),
+                )
         except Exception as e:
             # mark all (logical) blocks for this request as invalid
             trace_event(
