@@ -8,6 +8,10 @@ COPY vllm/distributed/kv_transfer/kv_connector/v1/nixl/pull_worker.py \
   /usr/local/lib/python3.10/dist-packages/vllm/distributed/kv_transfer/kv_connector/v1/nixl/pull_worker.py
 COPY vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py \
   /usr/local/lib/python3.10/dist-packages/vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py
+COPY vllm/distributed/kv_transfer/kv_connector/v1/nixl/metadata.py \
+  /usr/local/lib/python3.10/dist-packages/vllm/distributed/kv_transfer/kv_connector/v1/nixl/metadata.py
+COPY vllm/distributed/kv_transfer/kv_connector/v1/nixl/cuda_ipc_gather.py \
+  /usr/local/lib/python3.10/dist-packages/vllm/distributed/kv_transfer/kv_connector/v1/nixl/cuda_ipc_gather.py
 COPY vllm/v1/core/sched/scheduler.py \
   /usr/local/lib/python3.10/dist-packages/vllm/v1/core/sched/scheduler.py
 COPY vllm/benchmarks/datasets/datasets.py \
@@ -17,15 +21,22 @@ COPY vllm/benchmarks/lib/endpoint_request_func.py \
 
 COPY benchmarks/pd_transfer /opt/pd-transfer
 
+RUN nvcc -O3 -std=c++17 -shared -Xcompiler=-fPIC \
+    -gencode arch=compute_80,code=sm_80 \
+    /opt/pd-transfer/cuda_ipc_p2p/cuda_ipc_gather.cu \
+    -o /usr/local/lib/python3.10/dist-packages/vllm/distributed/kv_transfer/kv_connector/v1/nixl/libvllm_pd_cuda_ipc_gather.so
+
 RUN chmod +x /opt/pd-transfer/run_pd_transfer_bench.sh \
     /opt/pd-transfer/run_pd_transfer_scale_sweep.sh \
     /opt/pd-transfer/run_pd_transfer_sleep_sweep.sh \
   && python3 -c "from vllm.distributed.kv_transfer.pd_trace import trace_event" \
+  && python3 -c "from vllm.distributed.kv_transfer.kv_connector.v1.nixl.pull_worker import NixlPullConnectorWorker" \
   && grep -q 'prefill_compute_done' \
     /usr/local/lib/python3.10/dist-packages/vllm/distributed/kv_transfer/kv_connector/v1/nixl/pull_scheduler.py \
   && grep -q 'transfer_reported_done' \
     /usr/local/lib/python3.10/dist-packages/vllm/v1/core/sched/scheduler.py \
   && grep -q 'transfer_injected_sleep_start' \
-    /usr/local/lib/python3.10/dist-packages/vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py
+    /usr/local/lib/python3.10/dist-packages/vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py \
+  && test -f /usr/local/lib/python3.10/dist-packages/vllm/distributed/kv_transfer/kv_connector/v1/nixl/libvllm_pd_cuda_ipc_gather.so
 
 WORKDIR /workspace/vllm-study

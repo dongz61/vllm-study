@@ -104,8 +104,30 @@ baseline.
 - It does not replace NIXL notifications or failure handling.
 - It does not yet support the real per-layer/per-KV-group layout.
 
-If the proof of concept is correct and faster than the traced NIXL path, the
-next version should keep one IPC mapping for each P rank's registered KV cache
-pool and pass request-specific source/destination block-index arrays to a
-block-gather kernel. That is the appropriate point to integrate with
-`NixlPullConnectorWorker._read_blocks()`.
+The integration below is the follow-up to this standalone measurement: it
+keeps IPC mappings open and passes request-specific block-index arrays to a
+block-gather kernel.
+
+## Experimental vLLM integration
+
+The repository now includes that fixed-layout integration for this one target:
+Qwen3-8B BF16, one host, P TP=2, D TP=1, FlashAttention HND KV cache. NIXL is
+still used for handshakes, request leases, and completion notifications; the
+two NIXL READ submissions are replaced by one CUDA IPC gather launch.
+
+Rebuild `Dockerfile.pd-v24`, then use a benchmark config containing:
+
+```bash
+PREFILL_DEVICES="0,1"
+PREFILL_TP_SIZE=2
+DECODE_DEVICES="2"
+DECODE_TP_SIZE=1
+ENABLE_CUDA_IPC_GATHER=1
+```
+
+Run the normal benchmark command. Decode `transfer_rank_done_observed` records
+have `backend="cuda_ipc_gather"`, `kernel_ms`, and
+`submit_to_done_observed_ms`. The parsed CSV exposes
+`max_cuda_ipc_kernel_ms`. Set the flag back to `0` for the NIXL data-path
+baseline. This path intentionally rejects other model geometries, layouts,
+host buffers, packed/cross-layer caches, and TP configurations.

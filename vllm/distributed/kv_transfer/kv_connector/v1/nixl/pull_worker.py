@@ -10,6 +10,9 @@ import numpy as np
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker import (
     NixlBaseConnectorWorker,
 )
+from vllm.distributed.kv_transfer.kv_connector.v1.nixl.cuda_ipc_gather import (
+    CudaIpcGatherTransfer,
+)
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
     NixlConnectorMetadata,
     ReqMeta,
@@ -41,6 +44,7 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
         kv_cache_config: "KVCacheConfig",
     ):
         super().__init__(vllm_config, engine_id, kv_cache_config)
+        self._cuda_ipc_transfers: dict[str, CudaIpcGatherTransfer] = {}
 
     def start_load_kv(self, metadata: NixlConnectorMetadata):
         """
@@ -162,10 +166,50 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
             time.perf_counter_ns() if trace_enabled else 0
         )
 
+        use_cuda_ipc = (
+            self._cuda_ipc_gather_enabled
+            and len(read_specs) == 2
+            and {spec.remote_rank for spec in read_specs} == {0, 1}
+            and all(
+                len(spec.local_block_ids) == 1
+                and bool(spec.local_block_ids[0])
+                for spec in read_specs
+            )
+        )
+        if use_cuda_ipc:
+            self._read_blocks_cuda_ipc(
+                read_specs,
+                request_id=req_id,
+                dst_engine_id=meta.remote.engine_id,
+                remote_request_id=meta.remote.request_id,
+            )
+            if trace_enabled:
+                request_prepare_done_ns = time.perf_counter_ns()
+                trace_event(
+                    "transfer_request_prepare_done",
+                    req_id,
+                    role="decode",
+                    tp_rank=self.tp_rank,
+                    local_tp_size=self.world_size,
+                    remote_tp_size=remote_info.remote_tp_size,
+                    num_remote_ranks=len(read_specs),
+                    backend="cuda_ipc_gather",
+                    read_plan_ms=_duration_ms(
+                        request_prepare_start_ns, read_plan_done_ns
+                    ),
+                    rank_submit_loop_ms=_duration_ms(
+                        read_plan_done_ns, request_prepare_done_ns
+                    ),
+                    request_prepare_total_ms=_duration_ms(
+                        request_prepare_start_ns, request_prepare_done_ns
+                    ),
+                )
+            return
+
         for i, spec in enumerate(read_specs):
             remote_block_size = remote_info.remote_block_size
             logger.debug(
-                "Remote agent %s available, calling _read_blocks"调
+                "Remote agent %s available, calling _read_blocks"
                 " on remote rank %s with remote block size %s for req %s",
                 meta.remote.engine_id,
                 spec.remote_rank,
@@ -228,6 +272,152 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
             for rank_to_notify, agent in remote_agents.items():
                 if rank_to_notify != read_specs[0].remote_rank:
                     self.nixl_wrapper.send_notif(agent, notif_msg=notif_id)
+
+    def _read_blocks_cuda_ipc(
+        self,
+        read_specs: list[ReadSpec],
+        request_id: str,
+        dst_engine_id: str,
+        remote_request_id: str,
+    ) -> None:
+        """Launch one fixed-layout kernel that gathers P0 and P1 into D."""
+        assert self.transfer_topo is not None
+        manager = self._cuda_ipc_manager
+        if manager is None:
+            raise RuntimeError("CUDA IPC manager was not initialized by handshake")
+
+        remote_info = self.transfer_topo.get_engine_info(dst_engine_id)
+        specs_by_rank = {spec.remote_rank: spec for spec in read_specs}
+        spec0 = specs_by_rank[0]
+        spec1 = specs_by_rank[1]
+        local0, remote0 = self._apply_prefix_caching(
+            spec0.local_block_ids,
+            spec0.remote_block_ids,
+            remote_info.remote_physical_blocks_per_logical,
+        )
+        local1, remote1 = self._apply_prefix_caching(
+            spec1.local_block_ids,
+            spec1.remote_block_ids,
+            remote_info.remote_physical_blocks_per_logical,
+        )
+        if local0 != local1 or len(local0) != 1:
+            raise ValueError("CUDA IPC gather requires identical one-group D blocks")
+        if len(remote0) != 1 or len(remote1) != 1:
+            raise ValueError("CUDA IPC gather requires one KV cache group")
+
+        try:
+            if request_id in self._cuda_ipc_transfers:
+                raise RuntimeError(f"duplicate CUDA IPC request {request_id}")
+            transfer = manager.launch(
+                dst_engine_id,
+                remote_request_id,
+                (0, 1),
+                local0[0],
+                remote0[0],
+                remote1[0],
+                remote_info.remote_block_len,
+                self.block_len_per_layer[0],
+            )
+            self._cuda_ipc_transfers[request_id] = transfer
+            trace_event(
+                "transfer_submit",
+                request_id,
+                role="decode",
+                tp_rank=self.tp_rank,
+                local_tp_size=self.world_size,
+                remote_tp_size=remote_info.remote_tp_size,
+                remote_rank="0;1",
+                backend="cuda_ipc_gather",
+                num_descriptors=transfer.num_blocks * 36 * 2 * 2,
+                num_local_blocks=transfer.num_blocks,
+                num_remote_blocks=transfer.num_blocks * 2,
+                num_kv_groups=1,
+                bytes_transferred=transfer.bytes_transferred,
+                rank_prepare_total_ms=round(transfer.launch_host_ms, 3),
+                cuda_ipc_launch_host_ms=round(transfer.launch_host_ms, 3),
+            )
+        except Exception as error:
+            trace_event(
+                "transfer_failed",
+                request_id,
+                role="decode",
+                tp_rank=self.tp_rank,
+                backend="cuda_ipc_gather",
+                error=repr(error),
+            )
+            self._log_failure(
+                failure_type="cuda_ipc_gather_setup_failed",
+                req_id=request_id,
+                msg="Marking blocks as invalid",
+                error=error,
+                dst_engine_id=dst_engine_id,
+            )
+            self._handle_failed_transfer(request_id, None)
+
+    def _pop_cuda_ipc_done_transfers(self) -> set[str]:
+        done_req_ids: set[str] = set()
+        for req_id, transfer in list(self._cuda_ipc_transfers.items()):
+            try:
+                if not transfer.is_done():
+                    continue
+                done_ns = time.perf_counter_ns()
+                kernel_ms = transfer.kernel_ms()
+                notif_id = (
+                    f"{transfer.remote_request_id}:{self.world_size}".encode()
+                )
+                for rank in transfer.remote_ranks:
+                    agent_name = self._remote_agents[transfer.remote_engine_id][rank]
+                    try:
+                        self.nixl_wrapper.send_notif(
+                            agent_name, notif_msg=notif_id
+                        )
+                    except Exception as error:
+                        self._log_failure(
+                            failure_type="notification_failed",
+                            msg="P worker blocks will be freed after timeout.",
+                            req_id=req_id,
+                            error=error,
+                            dst_engine_id=transfer.remote_engine_id,
+                            remote_rank=rank,
+                            remote_agent_name=agent_name,
+                        )
+                        self.xfer_stats.record_failed_notification()
+                trace_event(
+                    "transfer_rank_done_observed",
+                    req_id,
+                    role="decode",
+                    tp_rank=self.tp_rank,
+                    local_tp_size=self.world_size,
+                    remote_rank="0;1",
+                    backend="cuda_ipc_gather",
+                    kernel_ms=round(kernel_ms, 3),
+                    submit_to_done_observed_ms=round(
+                        (done_ns - transfer.submit_ns) / 1_000_000, 3
+                    ),
+                    bytes_transferred=transfer.bytes_transferred,
+                    num_blocks=transfer.num_blocks,
+                )
+                del self._cuda_ipc_transfers[req_id]
+                if self._mark_recv_physical_done(req_id, failed=False):
+                    done_req_ids.add(req_id)
+            except Exception as error:
+                del self._cuda_ipc_transfers[req_id]
+                trace_event(
+                    "transfer_failed",
+                    req_id,
+                    role="decode",
+                    tp_rank=self.tp_rank,
+                    backend="cuda_ipc_gather",
+                    error=repr(error),
+                )
+                self._log_failure(
+                    failure_type="cuda_ipc_gather_completion_failed",
+                    req_id=req_id,
+                    msg="Marking blocks as invalid",
+                    error=error,
+                )
+                self._handle_failed_transfer(req_id, None)
+        return done_req_ids
 
     def _read_blocks(
         self,

@@ -243,6 +243,9 @@ def build_rows(root: Path) -> list[dict[str, Any]]:
             "max_nixl_xfer_duration_ms": _aggregate_numeric_field(
                 rank_done_records, "nixl_xfer_duration_ms", "max"
             ),
+            "max_cuda_ipc_kernel_ms": _aggregate_numeric_field(
+                rank_done_records, "kernel_ms", "max"
+            ),
             "max_nixl_post_duration_ms": _aggregate_numeric_field(
                 rank_done_records, "nixl_post_duration_ms", "max"
             ),

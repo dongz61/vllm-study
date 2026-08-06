@@ -39,8 +39,19 @@ PUSH_REG_NOTIF_PREFIX = b"PUSH_REG:"
 #   2: Add remote_request_id to kv_transfer_params
 #   3: Add physical_blocks_per_logical_kv_block to NixlAgentMetadata
 #   4: Add KV block lease renewal through heartbeats
+#   5: Add optional CUDA IPC KV region metadata
 #
-NIXL_CONNECTOR_VERSION: int = 4
+NIXL_CONNECTOR_VERSION: int = 5
+
+
+@dataclass
+class CudaIpcRegion:
+    """One tensor region inside a CUDA IPC-exported allocator allocation."""
+
+    handle: bytes
+    data_offset_bytes: int
+    region_size_bytes: int
+    allocation_size_bytes: int
 
 
 @dataclass
@@ -56,6 +67,7 @@ class NixlAgentMetadata:
     ssm_sizes: tuple[int, int]
     attn_backend_name: str
     physical_blocks_per_logical_kv_block: int
+    cuda_ipc_regions: list[CudaIpcRegion] | None = None
 
 
 @dataclass

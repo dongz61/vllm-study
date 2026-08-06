@@ -23,6 +23,7 @@ WARMUP_OUTPUT_LEN=${WARMUP_OUTPUT_LEN:-16}
 WARMUP_CONCURRENCY=${WARMUP_CONCURRENCY:-1}
 WARMUP_SEED=${WARMUP_SEED:-900000}
 TRANSFER_SLEEP_MS=${TRANSFER_SLEEP_MS_OVERRIDE:-${TRANSFER_SLEEP_MS:-0}}
+ENABLE_CUDA_IPC_GATHER=${ENABLE_CUDA_IPC_GATHER:-0}
 
 PIDS=()
 CLEANUP_PIDS=()
@@ -124,6 +125,16 @@ validate_config() {
     echo "TRANSFER_SLEEP_MS must be non-negative, got ${TRANSFER_SLEEP_MS}" >&2
     exit 1
   fi
+  if [[ "${ENABLE_CUDA_IPC_GATHER}" != "0" \
+        && "${ENABLE_CUDA_IPC_GATHER}" != "1" ]]; then
+    echo "ENABLE_CUDA_IPC_GATHER must be 0 or 1" >&2
+    exit 1
+  fi
+  if (( ENABLE_CUDA_IPC_GATHER == 1 )) \
+      && (( PREFILL_TP_SIZE != 2 || DECODE_TP_SIZE != 1 )); then
+    echo "CUDA IPC gather requires PREFILL_TP_SIZE=2 and DECODE_TP_SIZE=1" >&2
+    exit 1
+  fi
   IFS=',' read -r -a p_devices <<< "${PREFILL_DEVICES}"
   IFS=',' read -r -a d_devices <<< "${DECODE_DEVICES}"
   for p_device in "${p_devices[@]}"; do
@@ -221,8 +232,13 @@ wait_for_url() {
 
 kv_config() {
   local role=$1 engine_id=$2
-  printf '{"kv_connector":"NixlConnector","kv_role":"%s","engine_id":"%s"}' \
-    "${role}" "${engine_id}"
+  if (( ENABLE_CUDA_IPC_GATHER == 1 )); then
+    printf '{"kv_connector":"NixlConnector","kv_role":"%s","engine_id":"%s","kv_connector_extra_config":{"enable_cuda_ipc_gather":true}}' \
+      "${role}" "${engine_id}"
+  else
+    printf '{"kv_connector":"NixlConnector","kv_role":"%s","engine_id":"%s"}' \
+      "${role}" "${engine_id}"
+  fi
 }
 
 start_server() {
@@ -346,7 +362,8 @@ printf '"warmup_output_len":%s,"warmup_concurrency":%s,"warmup_seed":%s,' \
 printf '"trace_path":"%s","num_prompts":%s,"trace_time_scale":%s,' \
   "${MOONCAKE_TRACE_PATH}" "${NUM_PROMPTS}" "${TRACE_TIME_SCALE}" \
   >>"${RUN_ROOT}/run_manifest.json"
-printf '"transfer_sleep_ms":%s}\n' "${TRANSFER_SLEEP_MS}" \
+printf '"transfer_sleep_ms":%s,"cuda_ipc_gather":%s}\n' \
+  "${TRANSFER_SLEEP_MS}" "${ENABLE_CUDA_IPC_GATHER}" \
   >>"${RUN_ROOT}/run_manifest.json"
 
 start_server prefill "${PREFILL_PORT}" "${PREFILL_SIDE_CHANNEL_PORT}" \
@@ -362,7 +379,7 @@ start_proxy "${RUN_ROOT}/traces/proxy" "${RUN_ROOT}/proxy.log"
 wait_for_url "http://${HOST}:${PROXY_PORT}/healthcheck" proxy 300
 run_warmup "${RUN_ROOT}" "${RUN_ID}"
 
-echo "Running Mooncake trace: P_TP=${PREFILL_TP_SIZE}, D_TP=${DECODE_TP_SIZE}, transfer_sleep_ms=${TRANSFER_SLEEP_MS}"
+echo "Running Mooncake trace: P_TP=${PREFILL_TP_SIZE}, D_TP=${DECODE_TP_SIZE}, transfer_sleep_ms=${TRANSFER_SLEEP_MS}, cuda_ipc_gather=${ENABLE_CUDA_IPC_GATHER}"
 # shellcheck disable=SC2086
 vllm bench serve \
   --backend vllm \

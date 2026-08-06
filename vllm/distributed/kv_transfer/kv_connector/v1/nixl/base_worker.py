@@ -31,7 +31,12 @@ from vllm.distributed.kv_transfer.kv_connector.utils import (
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.base import CopyBlocksOp
 from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStats
+from vllm.distributed.kv_transfer.kv_connector.v1.nixl.cuda_ipc_gather import (
+    CudaIpcGatherManager,
+    export_cuda_ipc_region,
+)
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
+    CudaIpcRegion,
     GET_META_MSG,
     NixlAgentMetadata,
     NixlConnectorMetadata,
@@ -257,6 +262,13 @@ class NixlBaseConnectorWorker:
         self.nixl_backends = vllm_config.kv_transfer_config.get_from_extra_config(
             "backends", ["UCX"]
         )
+        self._cuda_ipc_gather_enabled = bool(
+            vllm_config.kv_transfer_config.get_from_extra_config(
+                "enable_cuda_ipc_gather", False
+            )
+        )
+        self._cuda_ipc_regions: list[CudaIpcRegion] = []
+        self._cuda_ipc_manager: CudaIpcGatherManager | None = None
         kv_lease_duration: int = vllm_config.kv_transfer_config.get_from_extra_config(
             "kv_lease_duration", 30
         )
@@ -857,6 +869,84 @@ class NixlBaseConnectorWorker:
         # Forwarding a real layer name rather than a synthetic key
         self.register_kv_caches({first_layer: kv_cache})
 
+    def _validate_cuda_ipc_gather_local_config(
+        self, kv_caches: dict[str, torch.Tensor]
+    ) -> None:
+        """Reject every configuration outside the fixed experiment target."""
+        assert self.transfer_topo is not None
+        model_config = self.vllm_config.model_config
+        if self.device_type != "cuda" or self.use_host_buffer:
+            raise ValueError("CUDA IPC gather requires device-resident CUDA KV cache")
+        if self.backend_name != "FLASH_ATTN" or self.kv_cache_layout != "HND":
+            raise ValueError("CUDA IPC gather requires FLASH_ATTN with HND layout")
+        if self.use_mla or self._has_mamba or self._is_hma_required:
+            raise ValueError("CUDA IPC gather supports only uniform full attention")
+        if self.transfer_topo.cross_layers_blocks:
+            raise ValueError("CUDA IPC gather does not support cross-layer packing")
+        if not self.transfer_topo.virtually_split_kv_in_blocks:
+            raise ValueError("CUDA IPC gather requires block-first joint K/V regions")
+        if (
+            model_config.get_total_num_kv_heads() != 8
+            or model_config.get_head_size() != 128
+            or model_config.get_total_num_hidden_layers() != 36
+        ):
+            raise ValueError(
+                "CUDA IPC gather is restricted to the Qwen3-8B KV geometry"
+            )
+        if self.world_size not in (1, 2):
+            raise ValueError("CUDA IPC gather requires local TP size 1 or 2")
+        if any(cache.dtype != torch.bfloat16 for cache in kv_caches.values()):
+            raise ValueError("CUDA IPC gather currently requires BF16 KV cache")
+        logger.warning(
+            "Experimental Qwen3-8B P2-D1 CUDA IPC gather data path enabled"
+        )
+
+    def _register_cuda_ipc_remote_regions(
+        self,
+        nixl_agent_meta: NixlAgentMetadata,
+        remote_tp_rank: int,
+        remote_tp_size: int,
+    ) -> None:
+        """Open P-side allocations and create persistent per-layer pointer tables."""
+        # P workers only export their handles. The D worker owns the mappings.
+        if self.world_size != 1:
+            return
+        if remote_tp_size != 2 or remote_tp_rank not in (0, 1):
+            raise ValueError("CUDA IPC gather requires D TP=1 and P TP=2")
+        regions = nixl_agent_meta.cuda_ipc_regions
+        if regions is None:
+            raise RuntimeError("Remote P worker did not export CUDA IPC regions")
+        if not (
+            len(regions)
+            == len(nixl_agent_meta.kv_caches_base_addr)
+            == len(self.kv_caches_base_addr[self.engine_id][self.tp_rank])
+            == 36
+        ):
+            raise ValueError("CUDA IPC gather requires exactly 36 KV regions")
+        if len(set(self.block_len_per_layer)) != 1:
+            raise ValueError("CUDA IPC gather requires uniform local block lengths")
+        if len(set(nixl_agent_meta.block_lens)) != 1:
+            raise ValueError("CUDA IPC gather requires uniform remote block lengths")
+        if any(
+            region.region_size_bytes
+            != nixl_agent_meta.num_blocks * nixl_agent_meta.block_lens[index]
+            for index, region in enumerate(regions)
+        ):
+            raise ValueError("CUDA IPC region sizes do not match remote KV geometry")
+        if self.block_len_per_layer[0] != 2 * nixl_agent_meta.block_lens[0]:
+            raise ValueError(
+                "CUDA IPC gather requires each D block to join two P blocks"
+            )
+
+        if self._cuda_ipc_manager is None:
+            local_bases = self.kv_caches_base_addr[self.engine_id][self.tp_rank]
+            self._cuda_ipc_manager = CudaIpcGatherManager(
+                self.device_id, local_bases
+            )
+        self._cuda_ipc_manager.register_remote_regions(
+            nixl_agent_meta.engine_id, remote_tp_rank, regions
+        )
+
     def _register_packed_kv_cache(
         self,
         storage: torch.UntypedStorage,
@@ -943,6 +1033,9 @@ class NixlBaseConnectorWorker:
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         """Register the KV Cache data in nixl."""
 
+        if self._cuda_ipc_gather_enabled:
+            self._cuda_ipc_regions.clear()
+
         # Detect packed allocation: all tensors are strided views into the
         # same backing storage (different data_ptr but same storage).
         # This happens with DSv4-style contiguous per-block packing.
@@ -953,6 +1046,10 @@ class NixlBaseConnectorWorker:
             }
             data_ptrs = {cache.data_ptr() for cache in kv_caches.values()}
             if len(storage_ptrs) == 1 and len(data_ptrs) > 1:
+                if self._cuda_ipc_gather_enabled:
+                    raise ValueError(
+                        "CUDA IPC gather does not support packed KV cache storage"
+                    )
                 self._register_packed_kv_cache(storage)
                 self.device_kv_caches = kv_caches
                 return
@@ -974,6 +1071,8 @@ class NixlBaseConnectorWorker:
         self.compat_hash = compute_nixl_compatibility_hash(
             self.vllm_config, self.backend_name, self.transfer_topo.cross_layers_blocks
         )
+        if self._cuda_ipc_gather_enabled:
+            self._validate_cuda_ipc_gather_local_config(kv_caches)
 
         if self.use_host_buffer:
             self.initialize_host_xfer_buffer(kv_caches=kv_caches)
@@ -1070,6 +1169,8 @@ class NixlBaseConnectorWorker:
                     "Registering layer %s with cache shape: %s", layer_name, cache.shape
                 )
                 seen_base_addresses.append(base_addr)
+                if self._cuda_ipc_gather_enabled and self.world_size == 2:
+                    self._cuda_ipc_regions.append(export_cuda_ipc_region(cache))
                 # Only record non-Mamba page sizes.
                 if isinstance(layer_spec, MambaSpec):
                     self.block_len_per_layer.append(
@@ -1187,6 +1288,9 @@ class NixlBaseConnectorWorker:
             attn_backend_name=self.backend_name,
             physical_blocks_per_logical_kv_block=(
                 self._physical_blocks_per_logical_kv_block
+            ),
+            cuda_ipc_regions=(
+                self._cuda_ipc_regions if self._cuda_ipc_gather_enabled else None
             ),
         )
         # Wrap metadata in payload with hash for defensive decoding
@@ -1525,6 +1629,10 @@ class NixlBaseConnectorWorker:
             nixl_agent_meta.kv_caches_base_addr
         )
         self._validate_remote_agent_handshake(nixl_agent_meta, remote_tp_size)
+        if self._cuda_ipc_gather_enabled:
+            self._register_cuda_ipc_remote_regions(
+                nixl_agent_meta, remote_tp_rank, remote_tp_size
+            )
 
         # This is 1 when P and D `--tensor-parallel-size` match. Otherwise,
         # this is the ratio between the two sizes.
@@ -1899,6 +2007,7 @@ class NixlBaseConnectorWorker:
         assert self.transfer_topo is not None
         done_sending = self._get_new_notifs()
         done_recving = self._pop_done_transfers(self._recving_transfers)
+        done_recving.update(self._pop_cuda_ipc_done_transfers())
 
         # Drain queue of requests where handshake or transfer setup failed.
         failed_recv_reqs = set[ReqId]()
@@ -1994,6 +2103,10 @@ class NixlBaseConnectorWorker:
         Subclasses must implement this to handle mode-specific notifications.
         """
         raise NotImplementedError
+
+    def _pop_cuda_ipc_done_transfers(self) -> set[str]:
+        """Pull workers override this when the experimental path is enabled."""
+        return set()
 
     def _handle_heartbeat(self, payload: str) -> None:
         """Extend leases for requests referenced in a heartbeat.
@@ -2117,37 +2230,39 @@ class NixlBaseConnectorWorker:
             if not in_progress:
                 # Only report request as completed when all transfers are done.
                 del transfers[req_id]
-                trace_event(
-                    "transfer_physical_done",
-                    req_id,
-                    role="decode",
-                    tp_rank=self.tp_rank,
-                    local_tp_size=self.world_size,
-                    success=not failed,
-                    injected_sleep_ms=self._pd_transfer_sleep_ms,
-                )
-                # Failed transfers must be reported immediately so the
-                # scheduler can enter its recompute/error path. Successful
-                # transfers use a deadline rather than time.sleep(), which
-                # would block polling for every other request on this worker.
-                if not failed and self._pd_transfer_sleep_ms > 0:
-                    ready_at = (
-                        time.perf_counter() + self._pd_transfer_sleep_ms / 1000
-                    )
-                    self._delayed_recving_transfers[req_id] = ready_at
-                    trace_event(
-                        "transfer_injected_sleep_start",
-                        req_id,
-                        role="decode",
-                        tp_rank=self.tp_rank,
-                        local_tp_size=self.world_size,
-                        sleep_ms=self._pd_transfer_sleep_ms,
-                    )
-                else:
+                if self._mark_recv_physical_done(req_id, failed):
                     done_req_ids.add(req_id)
             else:
                 transfers[req_id] = in_progress
         return done_req_ids
+
+    def _mark_recv_physical_done(self, req_id: str, failed: bool) -> bool:
+        """Trace physical completion and apply the optional delay injection."""
+        trace_event(
+            "transfer_physical_done",
+            req_id,
+            role="decode",
+            tp_rank=self.tp_rank,
+            local_tp_size=self.world_size,
+            success=not failed,
+            injected_sleep_ms=self._pd_transfer_sleep_ms,
+        )
+        # Failed transfers must be reported immediately so the scheduler can
+        # enter its recompute/error path. Successful transfers use a deadline
+        # so polling for other requests is not blocked.
+        if not failed and self._pd_transfer_sleep_ms > 0:
+            ready_at = time.perf_counter() + self._pd_transfer_sleep_ms / 1000
+            self._delayed_recving_transfers[req_id] = ready_at
+            trace_event(
+                "transfer_injected_sleep_start",
+                req_id,
+                role="decode",
+                tp_rank=self.tp_rank,
+                local_tp_size=self.world_size,
+                sleep_ms=self._pd_transfer_sleep_ms,
+            )
+            return False
+        return True
 
     def _pop_delayed_recv_transfers(self) -> set[str]:
         """Return physically-complete transfers whose delay has expired."""
@@ -2494,6 +2609,8 @@ class NixlBaseConnectorWorker:
             self.nixl_wrapper.release_dlist_handle(handle)
         for agent_name in self._remote_agents.pop(engine_id).values():
             self.nixl_wrapper.remove_remote_agent(agent_name)
+        if self._cuda_ipc_manager is not None:
+            self._cuda_ipc_manager.unregister_engine(engine_id)
 
         del self.kv_caches_base_addr[engine_id]
         del self.dst_num_blocks[engine_id]
@@ -2524,6 +2641,9 @@ class NixlBaseConnectorWorker:
         self._recving_transfers.clear()
         getattr(self, "_recv_transfer_trace_meta", {}).clear()
         self._delayed_recving_transfers.clear()
+        if self._cuda_ipc_manager is not None:
+            self._cuda_ipc_manager.close()
+            self._cuda_ipc_manager = None
         for handle in self.src_xfer_handles_by_block_size.values():
             self.nixl_wrapper.release_dlist_handle(handle)
         self.src_xfer_handles_by_block_size.clear()
