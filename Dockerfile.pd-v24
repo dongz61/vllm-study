@@ -29,6 +29,7 @@ RUN nvcc -O3 -std=c++17 -shared -Xcompiler=-fPIC \
 RUN chmod +x /opt/pd-transfer/run_pd_transfer_bench.sh \
     /opt/pd-transfer/run_pd_transfer_scale_sweep.sh \
     /opt/pd-transfer/run_pd_transfer_sleep_sweep.sh \
+    /opt/pd-transfer/nixl_p2d1/run.sh \
   && python3 -c "from vllm.distributed.kv_transfer.pd_trace import trace_event" \
   && python3 -c "from vllm.distributed.kv_transfer.kv_connector.v1.nixl.pull_worker import NixlPullConnectorWorker" \
   && grep -q 'prefill_compute_done' \
