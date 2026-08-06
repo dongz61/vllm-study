@@ -18,8 +18,34 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
 
 def export_cuda_ipc_region(tensor: torch.Tensor) -> CudaIpcRegion:
     """Export a tensor's allocator allocation handle and data offset."""
-    if not tensor.is_cuda or not tensor.is_contiguous():
-        raise ValueError("CUDA IPC KV regions must be contiguous CUDA tensors")
+    if not tensor.is_cuda:
+        raise ValueError("CUDA IPC KV regions must be CUDA tensors")
+    if tensor.ndim != 5 or tensor.shape[1] != 2:
+        raise ValueError(
+            "CUDA IPC gather requires [blocks, 2, tokens, heads, head_size] "
+            f"KV views, got shape={tuple(tensor.shape)}"
+        )
+
+    _, _, block_size, num_heads, head_size = tensor.shape
+    # FlashAttention HND allocates a contiguous physical
+    # [blocks, 2, heads, tokens, head_size] tensor and exposes the logical
+    # [blocks, 2, tokens, heads, head_size] view through permute(). The view is
+    # not torch-contiguous, but every complete block and its K/V halves are
+    # contiguous, which is exactly what the gather kernel addresses.
+    expected_stride = (
+        2 * num_heads * block_size * head_size,
+        num_heads * block_size * head_size,
+        head_size,
+        block_size * head_size,
+        1,
+    )
+    actual_stride = tuple(tensor.stride())
+    if actual_stride != expected_stride:
+        raise ValueError(
+            "CUDA IPC gather requires a dense block-first HND KV view; "
+            f"shape={tuple(tensor.shape)}, stride={actual_stride}, "
+            f"expected_stride={expected_stride}"
+        )
 
     _, rebuild_args = reduce_tensor(tensor)
     if len(rebuild_args) < 10:
