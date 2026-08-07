@@ -25,11 +25,11 @@ COMPONENT_FIELDS = (
     "physical_done_to_reported_ms",
 )
 COMPONENT_LABELS = (
-    "Prefill done -> D preparation start",
-    "D preparation start -> first submit",
-    "First submit -> last submit",
-    "Last submit -> physical done",
-    "Physical done -> reported done",
+    "Wait until D starts processing",
+    "Rank 0 transfer prep + submit",
+    "Rank 1 transfer prep + submit",
+    "Wait for all transfers to finish",
+    "Completion polling and reporting",
 )
 COMPONENT_COLORS = ("#4C78A8", "#72B7B2", "#F58518", "#E45756", "#54A24B")
 
@@ -430,6 +430,7 @@ def plot_internal_breakdown(cases: list[Case], output_path: Path) -> None:
     component_means = [
         [statistics.fmean(values) for values in case.components_ms] for case in cases
     ]
+    case_totals = [sum(values) for values in component_means]
 
     y_positions = list(range(len(cases)))
     left = [0.0] * len(cases)
@@ -447,23 +448,38 @@ def plot_internal_breakdown(cases: list[Case], output_path: Path) -> None:
             color=color,
             label=component_label,
         )
-        for y, start, value in zip(y_positions, left, values, strict=True):
-            if value >= 15:
+        for y, start, value, total in zip(
+            y_positions, left, values, case_totals, strict=True
+        ):
+            share = value / total * 100 if total else 0
+            if share >= 8:
                 ax.text(
                     start + value / 2,
                     y,
-                    f"{value:.1f} ms",
+                    f"{value:.1f} ms\n{share:.1f}%",
                     ha="center",
                     va="center",
                     color="white",
-                    fontsize=9,
+                    fontsize=8.5,
+                    fontweight="bold",
+                )
+            else:
+                ax.annotate(
+                    f"{value:.1f} ms ({share:.1f}%)",
+                    (start + value, y),
+                    xytext=(6, 0),
+                    textcoords="offset points",
+                    ha="left",
+                    va="center",
+                    fontsize=8.5,
+                    color=color,
                     fontweight="bold",
                 )
         left = [start + value for start, value in zip(left, values, strict=True)]
 
     ax.set_yticks(y_positions, labels)
     ax.invert_yaxis()
-    ax.set_xlim(left=0)
+    ax.set_xlim(0, max(case_totals) * 1.16)
     ax.set_xlabel("Mean latency (ms)")
     ax.set_title("PD Handoff Breakdown")
     ax.grid(axis="x", alpha=0.25)

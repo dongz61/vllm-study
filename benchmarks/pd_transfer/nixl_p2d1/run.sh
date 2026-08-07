@@ -20,12 +20,16 @@ TIMEOUT_SECONDS="${TIMEOUT_SECONDS:-300}"
 SKIP_DESC_MERGE="${SKIP_DESC_MERGE:-0}"
 ENABLE_CUDA_IPC_GATHER="${ENABLE_CUDA_IPC_GATHER:-1}"
 CUDA_IPC_REMOTE_BLOCK_BYTES="${CUDA_IPC_REMOTE_BLOCK_BYTES:-32KiB}"
+ENABLE_PACK_NIXL_SCATTER="${ENABLE_PACK_NIXL_SCATTER:-1}"
+PACK_STAGING_BYTES="${PACK_STAGING_BYTES:-64MiB}"
 
-if [[ "${ENABLE_CUDA_IPC_GATHER}" != "0" \
-      && "${ENABLE_CUDA_IPC_GATHER}" != "1" ]]; then
-  echo "ENABLE_CUDA_IPC_GATHER must be 0 or 1" >&2
-  exit 2
-fi
+for flag_name in ENABLE_CUDA_IPC_GATHER ENABLE_PACK_NIXL_SCATTER; do
+  flag_value="${!flag_name}"
+  if [[ "${flag_value}" != "0" && "${flag_value}" != "1" ]]; then
+    echo "${flag_name} must be 0 or 1" >&2
+    exit 2
+  fi
+done
 
 timestamp="$(date +%Y%m%d-%H%M%S)"
 OUTPUT_DIR="${OUTPUT_DIR:-${PWD}/nixl-p2d1-${timestamp}}"
@@ -56,6 +60,11 @@ if [[ "${ENABLE_CUDA_IPC_GATHER}" == "1" ]]; then
   cuda_ipc_args+=(--cuda-ipc-gather)
 fi
 
+pack_args=(--pack-staging-bytes "${PACK_STAGING_BYTES}")
+if [[ "${ENABLE_PACK_NIXL_SCATTER}" == "1" ]]; then
+  pack_args+=(--pack-nixl-scatter)
+fi
+
 "${PYTHON}" "${SCRIPT_DIR}/nixl_p2d1_microbench.py" producer \
   --rendezvous "${RUN_DIR}" \
   --rank 0 \
@@ -66,6 +75,7 @@ fi
   --num-threads "${NIXL_NUM_THREADS}" \
   --timeout-seconds "${TIMEOUT_SECONDS}" \
   "${cuda_ipc_args[@]}" \
+  "${pack_args[@]}" \
   >"${OUTPUT_DIR}/producer0.log" 2>&1 &
 producer0_pid=$!
 
@@ -79,6 +89,7 @@ producer0_pid=$!
   --num-threads "${NIXL_NUM_THREADS}" \
   --timeout-seconds "${TIMEOUT_SECONDS}" \
   "${cuda_ipc_args[@]}" \
+  "${pack_args[@]}" \
   >"${OUTPUT_DIR}/producer1.log" 2>&1 &
 producer1_pid=$!
 
@@ -98,6 +109,7 @@ consumer_args=(
   --iterations "${ITERATIONS}"
   --cuda-ipc-remote-block-bytes "${CUDA_IPC_REMOTE_BLOCK_BYTES}"
   "${cuda_ipc_args[@]}"
+  "${pack_args[@]}"
 )
 if [[ "${SKIP_DESC_MERGE}" == "1" ]]; then
   consumer_args+=(--skip-desc-merge)
