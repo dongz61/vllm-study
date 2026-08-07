@@ -102,6 +102,7 @@ def build_rows(root: Path) -> list[dict[str, Any]]:
         reported_done = _last(records, "transfer_reported_done")
         schedulable = _last(records, "transfer_schedulable")
         first_chunk = _first(records, "proxy_first_response_chunk")
+        decode_end = _last(records, "proxy_decode_end")
         submit_records = [
             record for record in records if record.get("event") == "transfer_submit"
         ]
@@ -119,6 +120,7 @@ def build_rows(root: Path) -> list[dict[str, Any]]:
         failed = any(record.get("event") == "transfer_failed" for record in records)
         full_wait_ms = "" if failed else _delta_ms(prefill_done, reported_done)
         proxy_ttft_ms = _delta_ms(received, first_chunk)
+        proxy_e2e_ms = _delta_ms(received, decode_end)
         physical_to_reported_ms = _delta_ms(physical_done, reported_done)
         sleep_start_to_end_ms = _delta_ms(sleep_start, sleep_end)
         # Request-level exposed injection is the interval from completion on
@@ -137,6 +139,9 @@ def build_rows(root: Path) -> list[dict[str, Any]]:
         wait_fraction = ""
         if full_wait_ms != "" and proxy_ttft_ms != "" and proxy_ttft_ms > 0:
             wait_fraction = round(full_wait_ms / proxy_ttft_ms, 6)
+        e2e_wait_fraction = ""
+        if full_wait_ms != "" and proxy_e2e_ms != "" and proxy_e2e_ms > 0:
+            e2e_wait_fraction = round(full_wait_ms / proxy_e2e_ms, 6)
 
         row = {
             "request_id": request_id,
@@ -256,6 +261,9 @@ def build_rows(root: Path) -> list[dict[str, Any]]:
                 submit_records, "num_descriptors", "sum"
             ),
             "submit_to_physical_done_ms": _delta_ms(submit, physical_done),
+            "last_submit_to_physical_done_ms": _delta_ms(
+                last_submit, physical_done
+            ),
             "configured_transfer_sleep_ms": configured_sleep_ms,
             "physical_done_to_sleep_start_ms": _delta_ms(physical_done, sleep_start),
             "injected_sleep_observed_ms": observed_sleep_ms,
@@ -269,9 +277,11 @@ def build_rows(root: Path) -> list[dict[str, Any]]:
             "physical_done_to_reported_ms": physical_to_reported_ms,
             "prefill_to_reported_ms": full_wait_ms,
             "prefill_to_reported_over_ttft": wait_fraction,
+            "prefill_to_reported_over_e2e": e2e_wait_fraction,
             "reported_to_schedulable_ms": _delta_ms(reported_done, schedulable),
             "reported_to_first_chunk_ms": _delta_ms(reported_done, first_chunk),
             "proxy_ttft_ms": proxy_ttft_ms,
+            "proxy_e2e_ms": proxy_e2e_ms,
         }
         rows.append(row)
     return sorted(rows, key=lambda row: row["request_id"])
@@ -304,6 +314,11 @@ def write_outputs(root: Path, rows: list[dict[str, Any]]) -> None:
         float(row["prefill_to_reported_over_ttft"])
         for row in rows
         if row["prefill_to_reported_over_ttft"] != ""
+    ]
+    e2e_fractions = [
+        float(row["prefill_to_reported_over_e2e"])
+        for row in rows
+        if row["prefill_to_reported_over_e2e"] != ""
     ]
     configured_sleep_values = sorted(
         {
@@ -342,6 +357,14 @@ def write_outputs(root: Path, rows: list[dict[str, Any]]) -> None:
             "p90": round(percentile(fractions, 0.90), 6),
             "p99": round(percentile(fractions, 0.99), 6),
             "max": round(max(fractions), 6),
+        }
+    if e2e_fractions:
+        summary["prefill_to_reported_over_e2e"] = {
+            "mean": round(statistics.fmean(e2e_fractions), 6),
+            "p50": round(percentile(e2e_fractions, 0.50), 6),
+            "p90": round(percentile(e2e_fractions, 0.90), 6),
+            "p99": round(percentile(e2e_fractions, 0.99), 6),
+            "max": round(max(e2e_fractions), 6),
         }
     if observed_sleep_values:
         summary["injected_sleep_observed_ms"] = {

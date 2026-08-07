@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
 
-"""Measure the NIXL data path for a single-host P2-D1 KV handoff."""
+"""Compare NIXL and CUDA IPC data paths for a single-host P2-D1 handoff."""
 
 from __future__ import annotations
 
@@ -15,6 +15,9 @@ import uuid
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
+
+
+_CUDA_IPC_NUM_LAYERS = 36
 
 
 def _parse_size(value: str) -> int:
@@ -72,6 +75,57 @@ def _agent_config(backend: str, num_threads: int, telemetry: bool):
         backends=[backend],
         capture_telemetry=telemetry,
     )
+
+
+def _export_cuda_ipc_allocation(tensor) -> dict[str, Any]:
+    from torch.multiprocessing.reductions import reduce_tensor
+
+    from vllm.distributed.kv_transfer.kv_connector.v1.nixl.cuda_ipc_gather import (
+        _unwrap_torch_cuda_ipc_handle,
+    )
+
+    if not tensor.is_cuda or not tensor.is_contiguous():
+        raise ValueError("CUDA IPC benchmark buffers must be contiguous CUDA tensors")
+
+    _, rebuild_args = reduce_tensor(tensor)
+    if len(rebuild_args) < 10:
+        raise RuntimeError("Unexpected torch CUDA IPC reduction tuple")
+
+    tensor_offset_elements = int(rebuild_args[3])
+    allocation_handle = _unwrap_torch_cuda_ipc_handle(bytes(rebuild_args[7]))
+    allocation_size_bytes = int(rebuild_args[8])
+    storage_offset_bytes = int(rebuild_args[9])
+    data_offset_bytes = (
+        storage_offset_bytes + tensor_offset_elements * tensor.element_size()
+    )
+    region_size_bytes = tensor.numel() * tensor.element_size()
+    if data_offset_bytes + region_size_bytes > allocation_size_bytes:
+        raise RuntimeError("CUDA IPC benchmark tensor exceeds its allocation")
+    return {
+        "handle": allocation_handle,
+        "data_offset_bytes": data_offset_bytes,
+        "region_size_bytes": region_size_bytes,
+        "allocation_size_bytes": allocation_size_bytes,
+    }
+
+
+def _cuda_ipc_geometry(
+    bytes_per_producer: int,
+    remote_block_bytes: int,
+) -> tuple[int, int]:
+    bytes_per_layer, remainder = divmod(
+        bytes_per_producer, _CUDA_IPC_NUM_LAYERS
+    )
+    num_request_blocks, block_remainder = divmod(
+        bytes_per_layer, remote_block_bytes
+    )
+    if remainder or block_remainder or num_request_blocks <= 0:
+        raise ValueError(
+            "CUDA IPC gather requires bytes_per_producer to be a positive "
+            f"multiple of {_CUDA_IPC_NUM_LAYERS} layers * "
+            "remote_block_bytes"
+        )
+    return bytes_per_layer, num_request_blocks
 
 
 def _descriptor_array(
@@ -137,6 +191,8 @@ def _producer(args: argparse.Namespace) -> None:
         "pattern": args.pattern,
         "rank": args.rank,
     }
+    if args.cuda_ipc_gather:
+        metadata["cuda_ipc_allocation"] = _export_cuda_ipc_allocation(tensor)
     metadata_path = args.rendezvous / f"producer{args.rank}.pkl"
     stop_path = args.rendezvous / "stop"
     _atomic_pickle(metadata_path, metadata)
@@ -327,6 +383,248 @@ def _summarize(records: list[dict[str, Any]]) -> dict[str, Any]:
     return summary
 
 
+def _summarize_cuda_ipc(records: list[dict[str, Any]]) -> dict[str, Any]:
+    summary: dict[str, Any] = {"iterations": len(records)}
+    for field in (
+        "request_total_ms",
+        "launch_host_ms",
+        "submit_to_done_observed_ms",
+        "kernel_ms",
+        "aggregate_remote_read_gbps",
+    ):
+        values = [float(record[field]) for record in records]
+        summary[field] = {
+            "mean": statistics.fmean(values),
+            "p50": statistics.median(values),
+            "p95": _percentile(values, 0.95),
+            "min": min(values),
+            "max": max(values),
+        }
+    return summary
+
+
+def _build_path_comparison(
+    nixl_cases: list[dict[str, Any]],
+    cuda_ipc_summary: dict[str, Any],
+) -> list[dict[str, Any]]:
+    comparisons = []
+    for cuda_case in cuda_ipc_summary["cases"]:
+        nixl_case = next(
+            (
+                case
+                for case in nixl_cases
+                if case["layout"] == cuda_case["layout"]
+                and case["descriptor_bytes"]
+                == cuda_case["equivalent_descriptor_bytes"]
+            ),
+            None,
+        )
+        if nixl_case is None:
+            continue
+        nixl_metrics = nixl_case["metrics"]
+        cuda_metrics = cuda_case["metrics"]
+        nixl_request_ms = nixl_metrics["request_total_ms"]["mean"]
+        cuda_request_ms = cuda_metrics["request_total_ms"]["mean"]
+        comparisons.append(
+            {
+                "layout": cuda_case["layout"],
+                "bytes_total": cuda_case["bytes_total"],
+                "equivalent_descriptor_bytes": cuda_case[
+                    "equivalent_descriptor_bytes"
+                ],
+                "equivalent_descriptors_per_rank": cuda_case[
+                    "equivalent_descriptors_per_rank"
+                ],
+                "nixl_effective_descriptors_per_rank": nixl_metrics[
+                    "rank0"
+                ]["desc_count"]["mean"],
+                "nixl_request_total_ms": nixl_request_ms,
+                "nixl_transfer_call_sum_ms": (
+                    nixl_metrics["rank0"]["transfer_call_ms"]["mean"]
+                    + nixl_metrics["rank1"]["transfer_call_ms"]["mean"]
+                ),
+                "cuda_ipc_request_total_ms": cuda_request_ms,
+                "cuda_ipc_launch_host_ms": cuda_metrics["launch_host_ms"][
+                    "mean"
+                ],
+                "cuda_ipc_kernel_ms": cuda_metrics["kernel_ms"]["mean"],
+                "cuda_ipc_speedup": nixl_request_ms / cuda_request_ms,
+            }
+        )
+    return comparisons
+
+
+def _validate_cuda_ipc_destination(
+    destination,
+    num_request_blocks: int,
+    remote_block_bytes: int,
+    patterns: list[int],
+) -> None:
+    import torch
+
+    remote_half_bytes = remote_block_bytes // 2
+    view = destination.view(
+        _CUDA_IPC_NUM_LAYERS,
+        num_request_blocks,
+        2,
+        2,
+        remote_half_bytes,
+    )
+    for rank, pattern in enumerate(patterns):
+        rank_view = view[:, :, :, rank, :]
+        if not bool(torch.all(rank_view == pattern).item()):
+            mismatch = int(torch.count_nonzero(rank_view != pattern).item())
+            raise RuntimeError(
+                f"CUDA IPC rank {rank} validation failed: "
+                f"{mismatch} bytes differ"
+            )
+
+
+def _run_cuda_ipc_benchmark(
+    args: argparse.Namespace,
+    producers: list[dict[str, Any]],
+) -> dict[str, Any]:
+    import torch
+
+    from vllm.distributed.kv_transfer.kv_connector.v1.nixl.cuda_ipc_gather import (
+        CudaIpcGatherManager,
+    )
+    from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
+        CudaIpcRegion,
+    )
+
+    remote_block_bytes = args.cuda_ipc_remote_block_bytes
+    if remote_block_bytes <= 0 or remote_block_bytes % 32:
+        raise ValueError(
+            "CUDA IPC remote block bytes must be positive and 32-byte aligned"
+        )
+    bytes_per_layer, num_request_blocks = _cuda_ipc_geometry(
+        args.bytes, remote_block_bytes
+    )
+    local_block_bytes = remote_block_bytes * 2
+    destination = torch.zeros(
+        args.bytes * 2,
+        dtype=torch.uint8,
+        device=f"cuda:{args.device}",
+    )
+    local_bases = [
+        destination.data_ptr() + layer * bytes_per_layer * 2
+        for layer in range(_CUDA_IPC_NUM_LAYERS)
+    ]
+    setup_start_ns = time.perf_counter_ns()
+    manager = CudaIpcGatherManager(args.device, local_bases)
+    engine_id = "nixl-p2d1-microbench"
+    try:
+        for rank, producer in enumerate(producers):
+            allocation = producer.get("cuda_ipc_allocation")
+            if allocation is None:
+                raise RuntimeError(
+                    f"producer {rank} did not export a CUDA IPC allocation"
+                )
+            regions = [
+                CudaIpcRegion(
+                    handle=allocation["handle"],
+                    data_offset_bytes=(
+                        allocation["data_offset_bytes"]
+                        + layer * bytes_per_layer
+                    ),
+                    region_size_bytes=bytes_per_layer,
+                    allocation_size_bytes=allocation["allocation_size_bytes"],
+                )
+                for layer in range(_CUDA_IPC_NUM_LAYERS)
+            ]
+            manager.register_remote_regions(engine_id, rank, regions)
+        torch.cuda.synchronize(args.device)
+        setup_ms = (time.perf_counter_ns() - setup_start_ns) / 1e6
+
+        output_path = args.output_dir / "cuda_ipc_iterations.jsonl"
+        summaries = []
+        with output_path.open("w", encoding="utf-8") as output:
+            for layout in args.layouts:
+                remote_block_ids = _descriptor_indices(
+                    num_request_blocks, layout
+                ).tolist()
+                local_block_ids = list(range(num_request_blocks))
+                records = []
+                for iteration in range(args.warmup + args.iterations):
+                    if iteration == args.warmup + args.iterations - 1:
+                        destination.zero_()
+                        torch.cuda.synchronize(args.device)
+                    request_start_ns = time.perf_counter_ns()
+                    transfer = manager.launch(
+                        engine_id=engine_id,
+                        remote_request_id=f"{layout}-{iteration}",
+                        remote_ranks=(0, 1),
+                        local_block_ids=local_block_ids,
+                        remote0_block_ids=remote_block_ids,
+                        remote1_block_ids=remote_block_ids,
+                        remote_block_bytes=remote_block_bytes,
+                        local_block_bytes=local_block_bytes,
+                    )
+                    deadline = time.monotonic() + args.timeout_seconds
+                    while not transfer.is_done():
+                        if time.monotonic() >= deadline:
+                            raise TimeoutError(
+                                "timed out waiting for CUDA IPC gather"
+                            )
+                    done_observed_ns = time.perf_counter_ns()
+                    kernel_ms = transfer.kernel_ms()
+                    record = {
+                        "path": "cuda_ipc_gather",
+                        "layout": layout,
+                        "iteration": iteration - args.warmup,
+                        "warmup": iteration < args.warmup,
+                        "request_total_ms": (
+                            done_observed_ns - request_start_ns
+                        )
+                        / 1e6,
+                        "launch_host_ms": transfer.launch_host_ms,
+                        "submit_to_done_observed_ms": (
+                            done_observed_ns - transfer.submit_ns
+                        )
+                        / 1e6,
+                        "kernel_ms": kernel_ms,
+                        "aggregate_remote_read_gbps": (
+                            transfer.bytes_transferred / kernel_ms / 1e6
+                        ),
+                    }
+                    if iteration >= args.warmup:
+                        output.write(json.dumps(record) + "\n")
+                        output.flush()
+                        records.append(record)
+
+                _validate_cuda_ipc_destination(
+                    destination,
+                    num_request_blocks,
+                    remote_block_bytes,
+                    [item["pattern"] for item in producers],
+                )
+                case = {
+                    "path": "cuda_ipc_gather",
+                    "layout": layout,
+                    "num_layers": _CUDA_IPC_NUM_LAYERS,
+                    "num_request_blocks": num_request_blocks,
+                    "remote_block_bytes": remote_block_bytes,
+                    "local_block_bytes": local_block_bytes,
+                    "bytes_per_producer": args.bytes,
+                    "bytes_total": args.bytes * 2,
+                    "equivalent_descriptor_bytes": remote_block_bytes // 2,
+                    "equivalent_descriptors_per_rank": (
+                        _CUDA_IPC_NUM_LAYERS * num_request_blocks * 2
+                    ),
+                    "metrics": _summarize_cuda_ipc(records),
+                    "validation_errors": 0,
+                }
+                summaries.append(case)
+                print(json.dumps(case), flush=True)
+        return {
+            "persistent_setup_ms": setup_ms,
+            "cases": summaries,
+        }
+    finally:
+        manager.close()
+
+
 def _consumer(args: argparse.Namespace) -> None:
     import torch
     from nixl._api import nixl_agent
@@ -340,7 +638,12 @@ def _consumer(args: argparse.Namespace) -> None:
     if any(item["bytes"] != args.bytes for item in producers):
         raise ValueError("consumer and producer buffer sizes do not match")
 
+    args.output_dir.mkdir(parents=True, exist_ok=True)
     torch.cuda.set_device(args.device)
+    cuda_ipc_summary = None
+    if args.cuda_ipc_gather:
+        cuda_ipc_summary = _run_cuda_ipc_benchmark(args, producers)
+
     destination = torch.zeros(
         args.bytes * 2,
         dtype=torch.uint8,
@@ -359,7 +662,6 @@ def _consumer(args: argparse.Namespace) -> None:
     summaries = []
 
     try:
-        args.output_dir.mkdir(parents=True, exist_ok=True)
         with output_path.open("w", encoding="utf-8") as output:
             for layout in args.layouts:
                 for descriptor_bytes in descriptor_sizes:
@@ -434,6 +736,7 @@ def _consumer(args: argparse.Namespace) -> None:
                             [item["pattern"] for item in producers],
                         )
                         case = {
+                            "path": "nixl",
                             "layout": layout,
                             "descriptor_bytes": descriptor_bytes,
                             "input_descriptor_count": descriptor_count,
@@ -461,6 +764,11 @@ def _consumer(args: argparse.Namespace) -> None:
             },
             "cases": summaries,
         }
+        if cuda_ipc_summary is not None:
+            summary["cuda_ipc_gather"] = cuda_ipc_summary
+            summary["comparison"] = _build_path_comparison(
+                summaries, cuda_ipc_summary
+            )
         (args.output_dir / "summary.json").write_text(
             json.dumps(summary, indent=2) + "\n",
             encoding="utf-8",
@@ -484,6 +792,7 @@ def _common_parser(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--backend", default="UCX")
     parser.add_argument("--num-threads", type=int, default=4)
     parser.add_argument("--timeout-seconds", type=float, default=300)
+    parser.add_argument("--cuda-ipc-gather", action="store_true")
 
 
 def _parse_args() -> argparse.Namespace:
@@ -510,6 +819,11 @@ def _parse_args() -> argparse.Namespace:
     consumer.add_argument("--warmup", type=int, default=3)
     consumer.add_argument("--iterations", type=int, default=10)
     consumer.add_argument("--skip-desc-merge", action="store_true")
+    consumer.add_argument(
+        "--cuda-ipc-remote-block-bytes",
+        type=_parse_size,
+        default=32 << 10,
+    )
     return parser.parse_args()
 
 

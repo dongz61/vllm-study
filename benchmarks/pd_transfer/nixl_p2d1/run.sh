@@ -18,6 +18,14 @@ NIXL_NUM_THREADS="${NIXL_NUM_THREADS:-4}"
 NIXL_BACKEND="${NIXL_BACKEND:-UCX}"
 TIMEOUT_SECONDS="${TIMEOUT_SECONDS:-300}"
 SKIP_DESC_MERGE="${SKIP_DESC_MERGE:-0}"
+ENABLE_CUDA_IPC_GATHER="${ENABLE_CUDA_IPC_GATHER:-1}"
+CUDA_IPC_REMOTE_BLOCK_BYTES="${CUDA_IPC_REMOTE_BLOCK_BYTES:-32KiB}"
+
+if [[ "${ENABLE_CUDA_IPC_GATHER}" != "0" \
+      && "${ENABLE_CUDA_IPC_GATHER}" != "1" ]]; then
+  echo "ENABLE_CUDA_IPC_GATHER must be 0 or 1" >&2
+  exit 2
+fi
 
 timestamp="$(date +%Y%m%d-%H%M%S)"
 OUTPUT_DIR="${OUTPUT_DIR:-${PWD}/nixl-p2d1-${timestamp}}"
@@ -43,6 +51,11 @@ trap cleanup EXIT INT TERM
 
 mkdir -p -- "${OUTPUT_DIR}"
 
+cuda_ipc_args=()
+if [[ "${ENABLE_CUDA_IPC_GATHER}" == "1" ]]; then
+  cuda_ipc_args+=(--cuda-ipc-gather)
+fi
+
 "${PYTHON}" "${SCRIPT_DIR}/nixl_p2d1_microbench.py" producer \
   --rendezvous "${RUN_DIR}" \
   --rank 0 \
@@ -52,6 +65,7 @@ mkdir -p -- "${OUTPUT_DIR}"
   --backend "${NIXL_BACKEND}" \
   --num-threads "${NIXL_NUM_THREADS}" \
   --timeout-seconds "${TIMEOUT_SECONDS}" \
+  "${cuda_ipc_args[@]}" \
   >"${OUTPUT_DIR}/producer0.log" 2>&1 &
 producer0_pid=$!
 
@@ -64,6 +78,7 @@ producer0_pid=$!
   --backend "${NIXL_BACKEND}" \
   --num-threads "${NIXL_NUM_THREADS}" \
   --timeout-seconds "${TIMEOUT_SECONDS}" \
+  "${cuda_ipc_args[@]}" \
   >"${OUTPUT_DIR}/producer1.log" 2>&1 &
 producer1_pid=$!
 
@@ -81,6 +96,8 @@ consumer_args=(
   --layouts "${layout_args[@]}"
   --warmup "${WARMUP}"
   --iterations "${ITERATIONS}"
+  --cuda-ipc-remote-block-bytes "${CUDA_IPC_REMOTE_BLOCK_BYTES}"
+  "${cuda_ipc_args[@]}"
 )
 if [[ "${SKIP_DESC_MERGE}" == "1" ]]; then
   consumer_args+=(--skip-desc-merge)
